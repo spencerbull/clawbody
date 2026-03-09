@@ -4,6 +4,7 @@ Handles environment variables and configuration settings for the application.
 """
 
 import os
+import logging
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
@@ -14,50 +15,99 @@ from dotenv import load_dotenv
 _project_root = Path(__file__).parent.parent.parent
 load_dotenv(_project_root / ".env")
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class Config:
     """Application configuration loaded from environment variables."""
-    
-    # OpenAI Configuration
+
+    # ---------------------------------------------------------------------------
+    # Speaches — local voice pipeline (STT + TTS via OpenAI-compatible Realtime API)
+    # ---------------------------------------------------------------------------
+    # Base URL of your speaches instance (set SPEACHES_BASE_URL in .envrc)
+    SPEACHES_BASE_URL: str = field(default_factory=lambda: os.getenv("SPEACHES_BASE_URL", "http://localhost:8233"))
+    # API key sent to speaches — any non-empty string works unless speaches has
+    # api_key configured; defaults to a placeholder so the SDK doesn't complain.
+    SPEACHES_API_KEY: str = field(default_factory=lambda: os.getenv("SPEACHES_API_KEY", "speaches"))
+    # The model name passed in the Realtime WebSocket URL — speaches forwards this
+    # to its chat_completion_base_url (your vLLM instance).  Set this to whatever
+    # model ID your vLLM server has loaded.
+    SPEACHES_REALTIME_MODEL: str = field(
+        default_factory=lambda: os.getenv("SPEACHES_REALTIME_MODEL", "gpt-4o-realtime-preview")
+    )
+    # faster-whisper model to use for speech-to-text inside speaches
+    SPEACHES_STT_MODEL: str = field(
+        default_factory=lambda: os.getenv("SPEACHES_STT_MODEL", "Systran/faster-distil-whisper-small.en")
+    )
+    # Kokoro / Piper voice for TTS (see speaches docs for available voices)
+    SPEACHES_VOICE: str = field(default_factory=lambda: os.getenv("SPEACHES_VOICE", "af_heart"))
+
+    # ---------------------------------------------------------------------------
+    # OpenAI — optional, kept for fallback / future use
+    # ---------------------------------------------------------------------------
     OPENAI_API_KEY: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
+    # Legacy voice / model fields — superseded by SPEACHES_* above
     OPENAI_MODEL: str = field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-4o-realtime-preview-2024-12-17"))
     OPENAI_VOICE: str = field(default_factory=lambda: os.getenv("OPENAI_VOICE", "cedar"))
-    
-    # OpenClaw Gateway Configuration
+
+    # ---------------------------------------------------------------------------
+    # OpenClaw Gateway
+    # ---------------------------------------------------------------------------
     OPENCLAW_GATEWAY_URL: str = field(default_factory=lambda: os.getenv("OPENCLAW_GATEWAY_URL", "ws://localhost:18789"))
     OPENCLAW_TOKEN: Optional[str] = field(default_factory=lambda: os.getenv("OPENCLAW_TOKEN"))
     OPENCLAW_AGENT_ID: str = field(default_factory=lambda: os.getenv("OPENCLAW_AGENT_ID", "main"))
     # Session key for OpenClaw - uses "main" to share context with WhatsApp and other channels
     # Format: agent:<agent_id>:<session_key>, but we only need the session key part here
     OPENCLAW_SESSION_KEY: str = field(default_factory=lambda: os.getenv("OPENCLAW_SESSION_KEY", "main"))
-    
-    # Robot Configuration
+
+    # ---------------------------------------------------------------------------
+    # Robot
+    # ---------------------------------------------------------------------------
     ROBOT_NAME: Optional[str] = field(default_factory=lambda: os.getenv("ROBOT_NAME"))
-    
+
+    # ---------------------------------------------------------------------------
     # Feature Flags
-    ENABLE_OPENCLAW_TOOLS: bool = field(default_factory=lambda: os.getenv("ENABLE_OPENCLAW_TOOLS", "true").lower() == "true")
+    # ---------------------------------------------------------------------------
+    ENABLE_OPENCLAW_TOOLS: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_OPENCLAW_TOOLS", "true").lower() == "true"
+    )
     ENABLE_CAMERA: bool = field(default_factory=lambda: os.getenv("ENABLE_CAMERA", "true").lower() == "true")
-    ENABLE_FACE_TRACKING: bool = field(default_factory=lambda: os.getenv("ENABLE_FACE_TRACKING", "true").lower() == "true")
-    
+    ENABLE_FACE_TRACKING: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_FACE_TRACKING", "true").lower() == "true"
+    )
+
     # Face Tracking Configuration
     # Options: "yolo", "mediapipe", or None for auto-detect
     HEAD_TRACKER_TYPE: Optional[str] = field(default_factory=lambda: os.getenv("HEAD_TRACKER_TYPE", "yolo"))
-    
+
+    # ---------------------------------------------------------------------------
     # Local Vision Processing
-    ENABLE_LOCAL_VISION: bool = field(default_factory=lambda: os.getenv("ENABLE_LOCAL_VISION", "false").lower() == "true")
-    LOCAL_VISION_MODEL: str = field(default_factory=lambda: os.getenv("LOCAL_VISION_MODEL", "HuggingFaceTB/SmolVLM2-256M-Video-Instruct"))
-    VISION_DEVICE: str = field(default_factory=lambda: os.getenv("VISION_DEVICE", "auto"))  # "auto", "cuda", "mps", "cpu"
+    # ---------------------------------------------------------------------------
+    ENABLE_LOCAL_VISION: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_LOCAL_VISION", "false").lower() == "true"
+    )
+    LOCAL_VISION_MODEL: str = field(
+        default_factory=lambda: os.getenv("LOCAL_VISION_MODEL", "HuggingFaceTB/SmolVLM2-256M-Video-Instruct")
+    )
+    VISION_DEVICE: str = field(
+        default_factory=lambda: os.getenv("VISION_DEVICE", "auto")
+    )  # "auto", "cuda", "mps", "cpu"
     HF_HOME: str = field(default_factory=lambda: os.getenv("HF_HOME", os.path.expanduser("~/.cache/huggingface")))
-    
+
     # Custom Profile (for personality customization)
     CUSTOM_PROFILE: Optional[str] = field(default_factory=lambda: os.getenv("REACHY_MINI_CUSTOM_PROFILE"))
-    
+
     def validate(self) -> list[str]:
         """Validate configuration and return list of errors."""
         errors = []
-        if not self.OPENAI_API_KEY:
-            errors.append("OPENAI_API_KEY is required")
+        if not self.SPEACHES_BASE_URL:
+            errors.append("SPEACHES_BASE_URL is required")
+        if self.OPENAI_API_KEY:
+            logger.warning(
+                "OPENAI_API_KEY is set but no longer used for the voice pipeline — "
+                "speaches handles STT/TTS locally. You can remove it from your .envrc."
+            )
         return errors
 
 
