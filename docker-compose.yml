@@ -2,17 +2,16 @@ services:
 
   # ============================================================================
   # vLLM — OpenAI-compatible LLM inference
-  # Listens on host port VLLM_HOST_PORT (default 8181)
+  # Listens on host port HOST_PORT (default 8181)
   # ============================================================================
-  vllm:
-    image: ${VLLM_IMAGE:-vllm/vllm-openai}:${VLLM_IMAGE_TAG:-cu130-nightly}
+  model:
+    image: ${VLLM_IMAGE:-vllm/vllm-openai}:${VLLM_IMAGE_TAG:-26.01-py3}
     container_name: ${CONTAINER_NAME:-vllm-model}
     runtime: nvidia
-    network_mode: host
     ipc: host
     shm_size: 16g
-    mem_limit: ${HOST_RAM_LIMIT:-48g}
-    memswap_limit: ${HOST_RAM_LIMIT:-48g}
+    mem_limit: ${HOST_RAM_LIMIT:-96g}
+    memswap_limit: ${HOST_RAM_LIMIT:-96g}
     ulimits:
       memlock: -1
       stack: 67108864
@@ -23,7 +22,9 @@ services:
       - VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASHINFER}
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
-      - ${LOCAL_MODEL_PATH:-/dev/null}:${LOCAL_MODEL_MOUNT_PATH:-/models/local}:ro
+      - ${LOCAL_MODEL_PATH:-/dev/null}:${LOCAL_MODEL_MOUNT_PATH:-/models/local-model}:ro
+    ports:
+      - "${HOST_PORT:-8181}:8000"
     entrypoint: ["/bin/bash", "-lc"]
     command:
       - >-
@@ -31,25 +32,31 @@ services:
         vllm serve ${MODEL_ID}
         --tokenizer ${TOKENIZER_ID}
         --host 0.0.0.0
-        --port ${VLLM_HOST_PORT:-8181}
+        --port 8000
         --served-model-name ${SERVED_MODEL_NAME:-model}
         --tensor-parallel-size ${TENSOR_PARALLEL_SIZE:-1}
-        --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.65}
-        --max-model-len ${MAX_MODEL_LEN:-65536}
-        --max-num-seqs ${MAX_NUM_SEQS:-5}
+        --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.9}
+        --max-model-len ${MAX_MODEL_LEN:-32768}
+        --max-num-seqs ${MAX_NUM_SEQS:-16}
         --max-num-batched-tokens ${MAX_BATCHED_TOKENS:-16384}
         --kv-cache-dtype ${KV_CACHE_DTYPE:-auto}
         --enable-prefix-caching
         --enable-chunked-prefill
         --trust-remote-code
         ${EXTRA_VLLM_ARGS:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT:-1}
+              capabilities: [gpu]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${VLLM_HOST_PORT:-8181}/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health || exit 1"]
       interval: 15s
       timeout: 10s
       retries: 60
       start_period: 90s
-    restart: unless-stopped
 
   # ============================================================================
   # speaches — local STT (faster-whisper) + TTS (Kokoro) via OpenAI Realtime API
@@ -65,12 +72,12 @@ services:
     runtime: nvidia
     network_mode: host
     depends_on:
-      vllm:
+      model:
         condition: service_healthy
     environment:
       # LLM backend — speaches forwards Realtime API chat turns here.
       # With host networking this is always localhost; update if vLLM moves to kyber.
-      CHAT_COMPLETION_BASE_URL: ${CHAT_COMPLETION_BASE_URL:-http://localhost:${VLLM_HOST_PORT:-8181}/v1}
+      CHAT_COMPLETION_BASE_URL: ${CHAT_COMPLETION_BASE_URL:-http://localhost:${HOST_PORT:-8181}/v1}
       CHAT_COMPLETION_API_KEY: ${CHAT_COMPLETION_API_KEY:-dummy}
 
       # Whisper STT on GPU

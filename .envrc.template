@@ -9,32 +9,32 @@
 # ------------------------------------------------------------------------------
 export CONTAINER_NAME=vllm-openclaw-qwen3.5-35b-a3b-nvfp4
 export VLLM_IMAGE=vllm/vllm-openai
-export VLLM_IMAGE_TAG=cu130-nightly
+export VLLM_IMAGE_TAG=v0.17.0-cu130
 export LOCAL_MODEL_PATH=/home/dell/genai/nvfp4-quant/output_models/saved_models_Qwen3_5-35B-A3B_nvfp4
 export LOCAL_MODEL_MOUNT_PATH=/models/local
-export MODEL_ID=/models/local
+export MODEL_ID=/models/Qwen3_5-35B-A3B-nvfp4
 export TOKENIZER_ID=Qwen/Qwen3.5-35B-A3B
 export SERVED_MODEL_NAME=qwen3.5-35b-a3b-nvfp4
-export VLLM_HOST_PORT=8181
+export HOST_PORT=8181
 export HOST_RAM_LIMIT=48g
 export GPU_MEMORY_UTILIZATION=0.65
-export MAX_MODEL_LEN=65536
-export MAX_NUM_SEQS=5
-export MAX_BATCHED_TOKENS=16384
-export KV_CACHE_DTYPE=auto
+export MAX_MODEL_LEN=262144
+export MAX_NUM_SEQS=2
+export MAX_BATCHED_TOKENS=262144
+export KV_CACHE_DTYPE=fp8
 export GPU_COUNT=1
 export TENSOR_PARALLEL_SIZE=1
 export VLLM_ATTENTION_BACKEND=FLASHINFER
 export PRE_LAUNCH_CMD=
-export EXTRA_VLLM_ARGS="--enable-auto-tool-choice --tool-call-parser hermes"
-export HF_TOKEN=
+export EXTRA_VLLM_ARGS="--reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder"
+export HF_TOKEN=$HF_TOKEN
 
 # ------------------------------------------------------------------------------
 # speaches
 # When vLLM is running locally (default): http://localhost:8181/v1
 # When vLLM is on kyber:                  http://kyber:8181/v1
 # ------------------------------------------------------------------------------
-export CHAT_COMPLETION_BASE_URL=http://localhost:${VLLM_HOST_PORT}/v1
+export CHAT_COMPLETION_BASE_URL=http://localhost:${HOST_PORT}/v1
 export CHAT_COMPLETION_API_KEY=dummy
 export SPEACHES_PORT=8233
 export SPEACHES_STT_MODEL=Systran/faster-distil-whisper-small.en
