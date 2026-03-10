@@ -27,6 +27,7 @@ PROTOCOL_VERSION = 3
 @dataclass
 class OpenClawResponse:
     """Response from OpenClaw gateway."""
+
     content: str
     error: Optional[str] = None
 
@@ -65,33 +66,17 @@ class OpenClawBridge:
         """
         import os
 
-        raw_url = (
-            gateway_url
-            or os.getenv("OPENCLAW_GATEWAY_URL")
-            or config.OPENCLAW_GATEWAY_URL
-        )
+        raw_url = gateway_url or os.getenv("OPENCLAW_GATEWAY_URL") or config.OPENCLAW_GATEWAY_URL
         # Normalise to ws:// (the gateway listens on the same port for both)
         self.gateway_url = self._normalise_ws_url(raw_url)
 
-        self.gateway_token = (
-            gateway_token
-            or os.getenv("OPENCLAW_TOKEN")
-            or config.OPENCLAW_TOKEN
-        )
-        self.agent_id = (
-            agent_id
-            or os.getenv("OPENCLAW_AGENT_ID")
-            or config.OPENCLAW_AGENT_ID
-        )
+        self.gateway_token = gateway_token or os.getenv("OPENCLAW_TOKEN") or config.OPENCLAW_TOKEN
+        self.agent_id = agent_id or os.getenv("OPENCLAW_AGENT_ID") or config.OPENCLAW_AGENT_ID
         self.timeout = timeout
 
         # Session key – "main" shares context with WhatsApp and other channels.
         # Full key format: agent:<agent_id>:<session_key>
-        self.session_key = (
-            os.getenv("OPENCLAW_SESSION_KEY")
-            or config.OPENCLAW_SESSION_KEY
-            or "main"
-        )
+        self.session_key = os.getenv("OPENCLAW_SESSION_KEY") or config.OPENCLAW_SESSION_KEY or "main"
 
         # Persistent WebSocket state
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
@@ -135,8 +120,13 @@ class OpenClawBridge:
             "set" if self.gateway_token else "not set",
         )
         try:
+            # The gateway checks the HTTP Origin header. The Python websockets
+            # library (v13+) does not send one by default, so we must supply it
+            # explicitly. The origin is the http(s) equivalent of the ws(s) URL.
+            origin = self.gateway_url.replace("wss://", "https://").replace("ws://", "http://")
             self._ws = await websockets.connect(
                 self.gateway_url,
+                additional_headers={"Origin": origin},
                 ping_interval=20,
                 ping_timeout=30,
                 close_timeout=5,
@@ -185,9 +175,7 @@ class OpenClawBridge:
                     self._conn_id,
                 )
                 # Start background listener
-                self._listener_task = asyncio.create_task(
-                    self._listen_loop(), name="openclaw-ws-listener"
-                )
+                self._listener_task = asyncio.create_task(self._listen_loop(), name="openclaw-ws-listener")
                 return True
             else:
                 err = hello.get("error", {})
@@ -280,9 +268,7 @@ class OpenClawBridge:
     # Request helpers
     # ------------------------------------------------------------------
 
-    async def _send_request(
-        self, method: str, params: dict, timeout: Optional[float] = None
-    ) -> dict:
+    async def _send_request(self, method: str, params: dict, timeout: Optional[float] = None) -> dict:
         """Send a request and wait for the response.
 
         Args:
@@ -389,9 +375,7 @@ class OpenClawBridge:
                 full_text = ""
                 while True:
                     try:
-                        event = await asyncio.wait_for(
-                            event_queue.get(), timeout=self.timeout
-                        )
+                        event = await asyncio.wait_for(event_queue.get(), timeout=self.timeout)
                         payload = event.get("payload", {})
                         event_name = event.get("event", "")
 
@@ -484,9 +468,7 @@ class OpenClawBridge:
                 prev_text = ""
                 while True:
                     try:
-                        event = await asyncio.wait_for(
-                            event_queue.get(), timeout=self.timeout
-                        )
+                        event = await asyncio.wait_for(event_queue.get(), timeout=self.timeout)
                         payload = event.get("payload", {})
                         event_name = event.get("event", "")
 
@@ -566,9 +548,7 @@ class OpenClawBridge:
             logger.error("Failed to get agent context: %s", e)
             return None
 
-    async def sync_conversation(
-        self, user_message: str, assistant_response: str
-    ) -> None:
+    async def sync_conversation(self, user_message: str, assistant_response: str) -> None:
         """Sync a conversation turn back to OpenClaw for memory continuity.
 
         Args:

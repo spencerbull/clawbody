@@ -125,6 +125,7 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
         self.last_activity_time = 0.0
         self.start_time = 0.0
         self._speaking = False  # True when robot is speaking
+        self._last_no_connection_warn = 0.0  # Throttle "not connected" warnings
 
         # OpenClaw agent context (fetched at startup)
         self._agent_context: Optional[str] = None
@@ -178,15 +179,37 @@ OpenClaw has access to many capabilities you don't have directly.""",
 
     async def start_up(self) -> None:
         """Start the handler and connect to speaches."""
-        self.client = AsyncOpenAI(
-            api_key=config.SPEACHES_API_KEY,
-            base_url=config.SPEACHES_BASE_URL,
-        )
+        logger.info("start_up: task started")
+        try:
+            # Derive the WebSocket base URL from the HTTP base URL.
+            # The OpenAI SDK does not reliably convert http:// → ws:// on its own
+            # (it may force wss:// regardless), so we pass it explicitly via
+            # websocket_base_url to avoid the [SSL: WRONG_VERSION_NUMBER] error.
+            http_base = config.SPEACHES_BASE_URL
+            if http_base.startswith("https://"):
+                ws_base = "wss://" + http_base[8:]
+            elif http_base.startswith("http://"):
+                ws_base = "ws://" + http_base[7:]
+            else:
+                ws_base = http_base  # already ws:// or wss://
+
+            logger.info("start_up: base=%s  ws=%s", http_base, ws_base)
+            self.client = AsyncOpenAI(
+                api_key=config.SPEACHES_API_KEY,
+                base_url=http_base,
+                websocket_base_url=ws_base,
+            )
+            logger.info("start_up: OpenAI client created")
+        except Exception as e:
+            logger.error("start_up: failed to create OpenAI client: %s", e)
+            raise
+
         self.start_time = asyncio.get_event_loop().time()
         self.last_activity_time = self.start_time
 
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
+            logger.info("start_up: session attempt %d/%d", attempt, max_attempts)
             try:
                 await self._run_session()
                 return
@@ -197,6 +220,19 @@ OpenClaw has access to many capabilities you don't have directly.""",
                     logger.info("Retrying in %.1f seconds...", delay)
                     await asyncio.sleep(delay)
                     continue
+                raise
+            except Exception as e:
+                logger.error(
+                    "Failed to connect to speaches at %s (attempt %d/%d): %s",
+                    config.SPEACHES_BASE_URL,
+                    attempt,
+                    max_attempts,
+                    e,
+                )
+                logger.error(
+                    "Ensure speaches is running and SPEACHES_BASE_URL is correct "
+                    "(expected format: http://<host>:<port>/v1)"
+                )
                 raise
             finally:
                 self.connection = None
@@ -222,10 +258,14 @@ OpenClaw has access to many capabilities you don't have directly.""",
                     "modalities": ["text", "audio"],
                     "instructions": system_instructions,
                     "voice": get_session_voice(),
-                    "input_audio_format": "pcm16",
-                    "output_audio_format": "pcm16",
+                    # Note: input_audio_format / output_audio_format are NOT sent —
+                    # speaches rejects them ("not configurable").  It always uses pcm16
+                    # internally so this is fine.
                     "input_audio_transcription": {
-                        "model": config.SPEACHES_STT_MODEL,
+                        # Omit "model" here: speaches routes transcription based on its
+                        # own PRELOAD_MODELS config.  Specifying a model name causes
+                        # speaches to try to route to an HTTP STT backend that may not
+                        # be set up, resulting in a 404.
                     },
                     "turn_detection": {
                         "type": "server_vad",
@@ -447,6 +487,13 @@ OpenClaw has access to many capabilities you don't have directly.""",
     async def receive(self, frame: Tuple[int, NDArray]) -> None:
         """Receive audio from the robot microphone."""
         if not self.connection:
+            now = asyncio.get_event_loop().time()
+            if now - self._last_no_connection_warn > 10.0:
+                logger.warning(
+                    "speaches not connected — audio dropped (check SPEACHES_BASE_URL=%s)",
+                    config.SPEACHES_BASE_URL,
+                )
+                self._last_no_connection_warn = now
             return
 
         input_sr, audio = frame

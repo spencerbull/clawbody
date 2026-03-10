@@ -26,7 +26,7 @@ class Config:
     # Speaches — local voice pipeline (STT + TTS via OpenAI-compatible Realtime API)
     # ---------------------------------------------------------------------------
     # Base URL of your speaches instance (set SPEACHES_BASE_URL in .envrc)
-    SPEACHES_BASE_URL: str = field(default_factory=lambda: os.getenv("SPEACHES_BASE_URL", "http://localhost:8233"))
+    SPEACHES_BASE_URL: str = field(default_factory=lambda: os.getenv("SPEACHES_BASE_URL", "http://localhost:8233/v1"))
     # API key sent to speaches — any non-empty string works unless speaches has
     # api_key configured; defaults to a placeholder so the SDK doesn't complain.
     SPEACHES_API_KEY: str = field(default_factory=lambda: os.getenv("SPEACHES_API_KEY", "speaches"))
@@ -126,6 +126,12 @@ def set_face_tracking_enabled(enabled: bool) -> None:
     """Enable or disable face tracking at runtime."""
     global config
     config.ENABLE_FACE_TRACKING = enabled
+
+
+def set_head_tracker_type(tracker_type: Optional[str]) -> None:
+    """Set the head tracker type at runtime."""
+    global config
+    config.HEAD_TRACKER_TYPE = tracker_type
 
 
 def set_local_vision_enabled(enabled: bool) -> None:

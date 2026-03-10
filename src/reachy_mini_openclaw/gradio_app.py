@@ -26,7 +26,7 @@ def launch_gradio(
     share: bool = False,
 ) -> None:
     """Launch the Gradio web UI.
-    
+
     Args:
         gateway_url: OpenClaw gateway URL
         robot_name: Robot name for connection
@@ -38,31 +38,36 @@ def launch_gradio(
     """
     from reachy_mini_openclaw.prompts import get_available_profiles, save_custom_profile
     from reachy_mini_openclaw.config import set_custom_profile, config
-    
+
     # State
     app_instance = None
-    
+
     def start_conversation():
         """Start the conversation."""
         nonlocal app_instance
-        
+
         from reachy_mini_openclaw.main import ClawBodyCore
         import asyncio
         import threading
-        
+
         if app_instance is not None:
             return "Already running"
-        
+
         try:
+            from reachy_mini_openclaw.config import set_face_tracking_enabled, set_head_tracker_type
+
+            if not enable_face_tracking:
+                set_face_tracking_enabled(False)
+            if head_tracker_type is not None:
+                set_head_tracker_type(head_tracker_type)
+
             app_instance = ClawBodyCore(
                 gateway_url=gateway_url,
                 robot_name=robot_name,
                 enable_camera=enable_camera,
                 enable_openclaw=enable_openclaw,
-                enable_face_tracking=enable_face_tracking,
-                head_tracker_type=head_tracker_type,
             )
-            
+
             # Run in background thread
             def run_app():
                 loop = asyncio.new_event_loop()
@@ -73,39 +78,39 @@ def launch_gradio(
                     logger.error("App error: %s", e)
                 finally:
                     loop.close()
-            
+
             thread = threading.Thread(target=run_app, daemon=True)
             thread.start()
-            
+
             return "Started successfully"
         except Exception as e:
             return f"Error: {e}"
-    
+
     def stop_conversation():
         """Stop the conversation."""
         nonlocal app_instance
-        
+
         if app_instance is None:
             return "Not running"
-        
+
         try:
             app_instance.stop()
             app_instance = None
             return "Stopped"
         except Exception as e:
             return f"Error: {e}"
-    
+
     def apply_profile(profile_name):
         """Apply a personality profile."""
         set_custom_profile(profile_name if profile_name else None)
         return f"Applied profile: {profile_name or 'default'}"
-    
+
     def save_profile(name, instructions):
         """Save a new profile."""
         if save_custom_profile(name, instructions):
             return f"Saved profile: {name}"
         return "Error saving profile"
-    
+
     # Build UI
     with gr.Blocks(title="Reachy Mini OpenClaw") as demo:
         gr.Markdown("""
@@ -114,51 +119,37 @@ def launch_gradio(
         Give your OpenClaw AI agent a physical presence with Reachy Mini.
         Using OpenAI Realtime API for responsive voice conversation.
         """)
-        
+
         with gr.Tab("Conversation"):
             with gr.Row():
                 start_btn = gr.Button("▶️ Start", variant="primary")
                 stop_btn = gr.Button("⏹️ Stop", variant="secondary")
-            
+
             status_text = gr.Textbox(label="Status", interactive=False)
-            
+
             transcript = gr.Chatbot(label="Conversation", height=400)
-            
+
             start_btn.click(start_conversation, outputs=[status_text])
             stop_btn.click(stop_conversation, outputs=[status_text])
-        
+
         with gr.Tab("Personality"):
             profiles = get_available_profiles()
-            profile_dropdown = gr.Dropdown(
-                choices=[""] + profiles,
-                label="Select Profile",
-                value=""
-            )
+            profile_dropdown = gr.Dropdown(choices=[""] + profiles, label="Select Profile", value="")
             apply_btn = gr.Button("Apply Profile")
             profile_status = gr.Textbox(label="Status", interactive=False)
-            
-            apply_btn.click(
-                apply_profile,
-                inputs=[profile_dropdown],
-                outputs=[profile_status]
-            )
-            
+
+            apply_btn.click(apply_profile, inputs=[profile_dropdown], outputs=[profile_status])
+
             gr.Markdown("### Create New Profile")
             new_name = gr.Textbox(label="Profile Name")
             new_instructions = gr.Textbox(
-                label="Instructions",
-                lines=10,
-                placeholder="Enter the system prompt for this personality..."
+                label="Instructions", lines=10, placeholder="Enter the system prompt for this personality..."
             )
             save_btn = gr.Button("Save Profile")
             save_status = gr.Textbox(label="Save Status", interactive=False)
-            
-            save_btn.click(
-                save_profile,
-                inputs=[new_name, new_instructions],
-                outputs=[save_status]
-            )
-        
+
+            save_btn.click(save_profile, inputs=[new_name, new_instructions], outputs=[save_status])
+
         with gr.Tab("Settings"):
             gr.Markdown(f"""
             ### Current Configuration
@@ -169,11 +160,11 @@ def launch_gradio(
             - **Camera Enabled**: {enable_camera}
             - **OpenClaw Enabled**: {enable_openclaw}
             - **Face Tracking**: {enable_face_tracking}
-            - **Head Tracker**: {head_tracker_type or 'auto-detect'}
+            - **Head Tracker**: {head_tracker_type or "auto-detect"}
             
             Edit `.env` file to change these settings.
             """)
-        
+
         with gr.Tab("About"):
             gr.Markdown("""
             ## About Reachy Mini OpenClaw
@@ -198,5 +189,5 @@ def launch_gradio(
             - [OpenClaw](https://github.com/openclaw/openclaw)
             - [OpenAI Realtime API](https://platform.openai.com/docs/guides/realtime)
             """)
-    
+
     demo.launch(share=share, server_name="0.0.0.0", server_port=7860)
