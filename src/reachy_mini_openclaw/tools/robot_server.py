@@ -32,7 +32,7 @@ class RobotToolServer:
             port: Port to bind to (defaults to config.ROBOT_TOOL_SERVER_PORT)
         """
         self.deps = deps
-        self.port = port or config.ROBOT_TOOL_SERVER_PORT
+        self.port = port if port is not None else config.ROBOT_TOOL_SERVER_PORT
         self.app = self._create_app()
         self.runner: Optional[web.AppRunner] = None
         self.site: Optional[web.TCPSite] = None
