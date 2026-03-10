@@ -312,13 +312,32 @@ OpenClaw has access to many capabilities you don't have directly.""",
             async for event in conn:
                 await self._handle_event(event)
 
-    async def _build_system_instructions(self) -> str:
+    async def _build_system_instructions(self, force_refresh: bool = False) -> str:
         """Build system instructions by fetching OpenClaw's context.
+
+        On the first call (or when force_refresh=True) the context is fetched
+        from OpenClaw.  On subsequent calls (speaches session reconnects) the
+        previously-fetched context is reused to avoid:
+          - polluting the main conversation history with repeated meta-requests
+          - snowballing context summaries that grow larger on every reconnect
+
+        Args:
+            force_refresh: If True, always re-fetch even if a cached copy exists.
 
         Returns:
             Complete system instructions combining OpenClaw identity + robot capabilities
         """
-        # Try to fetch context from OpenClaw
+        # Reuse cached context on reconnects unless a refresh is explicitly requested.
+        if self._agent_context and not force_refresh:
+            logger.info(
+                "Reusing cached OpenClaw agent context (%d chars) — skipping re-fetch",
+                len(self._agent_context),
+            )
+            return f"""{self._agent_context}
+
+{ROBOT_BODY_INSTRUCTIONS}"""
+
+        # First startup (or forced refresh): fetch from OpenClaw.
         agent_context = None
         if self.openclaw_bridge and self.openclaw_bridge.is_connected:
             logger.info("Fetching agent context from OpenClaw...")

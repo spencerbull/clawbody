@@ -312,6 +312,7 @@ class OpenClawBridge:
         message: str,
         image_b64: Optional[str] = None,
         system_context: Optional[str] = None,
+        session_key_suffix: Optional[str] = None,
     ) -> OpenClawResponse:
         """Send a message to OpenClaw and get a response.
 
@@ -324,6 +325,10 @@ class OpenClawBridge:
             image_b64: Optional base64-encoded image from robot camera (not yet
                        supported over WebSocket chat.send – reserved for future)
             system_context: Optional additional system context (prepended to message)
+            session_key_suffix: Override the session key suffix (e.g. "robot-sync").
+                When set, uses agent:<agent_id>:<session_key_suffix> instead of the
+                default session key.  Use this to keep meta-operations (context
+                fetching, sync) out of the main user conversation history.
 
         Returns:
             OpenClawResponse with the AI's response
@@ -342,7 +347,10 @@ class OpenClawBridge:
             final_message = f"[Image attached]\n{final_message}"
 
         idempotency_key = str(uuid.uuid4())
-        session_key = self._full_session_key()
+        if session_key_suffix is not None:
+            session_key = f"agent:{self.agent_id}:{session_key_suffix}"
+        else:
+            session_key = self._full_session_key()
 
         # Create a queue to collect events for this run
         # We'll get the runId from the response
@@ -511,6 +519,10 @@ class OpenClawBridge:
         - Important memories about the user
         - Current state
 
+        Uses a dedicated "robot-context" session so this meta-request does NOT
+        appear in the main user conversation history and cannot snowball the
+        context summary across reconnects.
+
         Returns:
             A context string to use as system instructions, or None if failed
         """
@@ -528,6 +540,9 @@ class OpenClawBridge:
                     "Be specific and personal. This context will be used by your robot body to speak and act AS YOU. "
                     "Output ONLY the context summary, no preamble."
                 ),
+                # Use a dedicated session so the context-fetch request/response
+                # doesn't pollute the main conversation history.
+                session_key_suffix="robot-context",
             )
 
             if response.error:
@@ -551,6 +566,10 @@ class OpenClawBridge:
     async def sync_conversation(self, user_message: str, assistant_response: str) -> None:
         """Sync a conversation turn back to OpenClaw for memory continuity.
 
+        Uses a dedicated "robot-sync" session so these bookkeeping messages do
+        NOT appear in the main user conversation history and cannot snowball
+        the context summary.
+
         Args:
             user_message: What the user said
             assistant_response: What the robot/AI responded
@@ -568,6 +587,9 @@ class OpenClawBridge:
                     "Reachy Mini robot body. Remember it as part of your ongoing conversation "
                     "with the user."
                 ),
+                # Use a dedicated session so sync messages stay out of the main
+                # conversation history and don't appear repeated in the webchat.
+                session_key_suffix="robot-sync",
             )
             logger.debug("Synced conversation to OpenClaw")
         except Exception as e:
