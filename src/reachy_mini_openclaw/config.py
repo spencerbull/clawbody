@@ -40,6 +40,10 @@ class Config:
     SPEACHES_STT_MODEL: str = field(
         default_factory=lambda: os.getenv("SPEACHES_STT_MODEL", "Systran/faster-distil-whisper-small.en")
     )
+    # Kokoro / Piper TTS model (must be downloaded in speaches before first use)
+    SPEACHES_TTS_MODEL: str = field(
+        default_factory=lambda: os.getenv("SPEACHES_TTS_MODEL", "speaches-ai/Kokoro-82M-v1.0-ONNX")
+    )
     # Kokoro / Piper voice for TTS (see speaches docs for available voices)
     SPEACHES_VOICE: str = field(default_factory=lambda: os.getenv("SPEACHES_VOICE", "af_heart"))
 

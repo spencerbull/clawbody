@@ -1,0 +1,43 @@
+ARG CUDA_BASE_IMAGE=nvidia/cuda:13.0.0-devel-ubuntu24.04
+FROM ${CUDA_BASE_IMAGE}
+
+ARG CUDA_ARCHITECTURES=121
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    build-essential \
+    cmake \
+    pkg-config \
+    python3 \
+    python3-pip \
+    libcurl4-openssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+RUN git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
+
+WORKDIR /app/llama.cpp
+
+# Stub needed for linking against CUDA at build time (no GPU required during build)
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so \
+           /usr/local/cuda/lib64/stubs/libcuda.so.1
+
+RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH} \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH} \
+    cmake -S . -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES} \
+        -DGGML_CUDA=ON \
+        -DLLAMA_BUILD_SERVER=ON \
+    && LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH} \
+       cmake --build build --target llama-server -j"$(nproc)"
+
+EXPOSE 8080
+
+ENTRYPOINT ["/app/llama.cpp/build/bin/llama-server"]
+CMD ["--help"]

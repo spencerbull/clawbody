@@ -138,6 +138,13 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
         self._shutdown_requested = False
         self._connected_event = asyncio.Event()
 
+        # Mic gating — prevent TTS audio from feeding back into the microphone.
+        # _speaking is True while the robot is generating/playing a response.
+        # _speaking_until is a grace-period timestamp: we keep the mic gated for
+        # 1 second after response.done to let buffered TTS audio finish draining
+        # out of the output queue before we start accepting mic input again.
+        self._speaking_until: float = 0.0
+
     def copy(self) -> "OpenAIRealtimeHandler":
         """Create a copy of the handler (required by fastrtc)."""
         return OpenAIRealtimeHandler(self.deps, self.openclaw_bridge, self.gradio_mode)
@@ -207,33 +214,44 @@ OpenClaw has access to many capabilities you don't have directly.""",
         self.start_time = asyncio.get_event_loop().time()
         self.last_activity_time = self.start_time
 
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
-            logger.info("start_up: session attempt %d/%d", attempt, max_attempts)
+        # Retry indefinitely — speaches can crash mid-session (e.g. empty Whisper
+        # transcript assertion in chat_utils.py) and we must reconnect automatically.
+        # Backoff: 1s, 2s, 4s, 8s, … capped at 30s.
+        attempt = 0
+        while not self._shutdown_requested:
+            attempt += 1
+            logger.info("start_up: session attempt %d", attempt)
             try:
                 await self._run_session()
+                # _run_session returned cleanly (shutdown requested) — exit.
                 return
             except ConnectionClosedError as e:
-                logger.warning("WebSocket closed unexpectedly (attempt %d/%d): %s", attempt, max_attempts, e)
-                if attempt < max_attempts:
-                    delay = (2 ** (attempt - 1)) + random.uniform(0, 0.5)
-                    logger.info("Retrying in %.1f seconds...", delay)
-                    await asyncio.sleep(delay)
-                    continue
-                raise
+                if self._shutdown_requested:
+                    return
+                delay = min(30.0, (2 ** min(attempt - 1, 5)) + random.uniform(0, 0.5))
+                logger.warning(
+                    "WebSocket closed unexpectedly (attempt %d): %s — reconnecting in %.1fs",
+                    attempt,
+                    e,
+                    delay,
+                )
+                await asyncio.sleep(delay)
             except Exception as e:
+                if self._shutdown_requested:
+                    return
+                delay = min(30.0, (2 ** min(attempt - 1, 5)) + random.uniform(0, 0.5))
                 logger.error(
-                    "Failed to connect to speaches at %s (attempt %d/%d): %s",
+                    "Session error at %s (attempt %d): %s — reconnecting in %.1fs",
                     config.SPEACHES_BASE_URL,
                     attempt,
-                    max_attempts,
                     e,
+                    delay,
                 )
                 logger.error(
                     "Ensure speaches is running and SPEACHES_BASE_URL is correct "
                     "(expected format: http://<host>:<port>/v1)"
                 )
-                raise
+                await asyncio.sleep(delay)
             finally:
                 self.connection = None
                 try:
@@ -257,19 +275,27 @@ OpenClaw has access to many capabilities you don't have directly.""",
                 session={
                     "modalities": ["text", "audio"],
                     "instructions": system_instructions,
+                    # speaches extension: selects the TTS model (Kokoro / Piper).
+                    # Without this, speaches falls back to its hardcoded default
+                    # ("speaches-ai/Kokoro-82M-v1.0-ONNX") regardless of SPEACHES_TTS_MODEL.
+                    "speech_model": config.SPEACHES_TTS_MODEL,
                     "voice": get_session_voice(),
                     # Note: input_audio_format / output_audio_format are NOT sent —
                     # speaches rejects them ("not configurable").  It always uses pcm16
                     # internally so this is fine.
                     "input_audio_transcription": {
-                        # Omit "model" here: speaches routes transcription based on its
-                        # own PRELOAD_MODELS config.  Specifying a model name causes
-                        # speaches to try to route to an HTTP STT backend that may not
-                        # be set up, resulting in a 404.
+                        # speaches requires the model name to route the transcription
+                        # request to the correct STT backend.  Without it, speaches
+                        # constructs the backend URL with "None" as the model name
+                        # (e.g. http://host/v1/None/v1/audio/transcriptions → 404).
+                        "model": config.SPEACHES_STT_MODEL,
                     },
                     "turn_detection": {
                         "type": "server_vad",
-                        "threshold": 0.5,
+                        # 0.7 is more conservative than the speaches default (0.5).
+                        # This reduces false positives from ambient noise / breathing,
+                        # which is a secondary defense against empty-transcript crashes.
+                        "threshold": 0.7,
                         "prefix_padding_ms": 300,
                         "silence_duration_ms": 600,
                     },
@@ -376,10 +402,16 @@ OpenClaw has access to many capabilities you don't have directly.""",
         # Response completed - sync conversation to OpenClaw
         if event_type == "response.done":
             self._speaking = False
+            # Grace period: keep mic gated for 1 second after response.done to let
+            # buffered TTS audio finish draining from the output queue.  Without this,
+            # the speaker plays the tail of the audio while the mic is already open,
+            # speaches VAD triggers on that audio, Whisper returns an empty transcript,
+            # and the assertion in speaches' chat_utils.py fires → session crash.
+            self._speaking_until = asyncio.get_event_loop().time() + 1.0
             self.deps.movement_manager.set_processing(False)
             if self.deps.head_wobbler is not None:
                 self.deps.head_wobbler.reset()
-            logger.debug("Response completed")
+            logger.debug("Response completed, mic gated for 1s grace period")
 
             # Sync conversation to OpenClaw for memory continuity
             await self._sync_to_openclaw()
@@ -484,8 +516,19 @@ OpenClaw has access to many capabilities you don't have directly.""",
             logger.error("OpenClaw query failed: %s", e)
             return {"error": str(e)}
 
-    async def receive(self, frame: Tuple[int, NDArray]) -> None:
-        """Receive audio from the robot microphone."""
+    async def receive(self, frame: Tuple[int, NDArray], *, source: str = "robot") -> None:
+        """Receive audio and forward to speaches.
+
+        Args:
+            frame: (sample_rate, audio_array) tuple from the microphone.
+            source: "robot" (default) or "browser".
+                - "robot": the TTS speaking gate is applied — robot has no AEC so
+                  we must block mic input while the speaker is active to prevent
+                  feedback that produces empty Whisper transcripts.
+                - "browser": the gate is bypassed — the browser handles acoustic
+                  echo cancellation (AEC) natively, so gating is unnecessary and
+                  would cause the browser mic to be silenced while the robot speaks.
+        """
         if not self.connection:
             now = asyncio.get_event_loop().time()
             if now - self._last_no_connection_warn > 10.0:
@@ -495,6 +538,15 @@ OpenClaw has access to many capabilities you don't have directly.""",
                 )
                 self._last_no_connection_warn = now
             return
+
+        # Mic gate: only for robot audio.  Drop frames while the robot is
+        # speaking or in the post-speech grace period to prevent the speaker's
+        # TTS audio from being picked up by the mic and producing empty
+        # Whisper transcripts (which crash the speaches session).
+        if source == "robot":
+            now = asyncio.get_event_loop().time()
+            if self._speaking or now < self._speaking_until:
+                return
 
         input_sr, audio = frame
 

@@ -116,6 +116,7 @@ class ClawBodyCore:
         enable_openclaw: bool = True,
         robot: Optional["ReachyMini"] = None,
         external_stop_event: Optional[threading.Event] = None,
+        browser_bridge: Optional[Any] = None,
     ):
         """Initialize the application.
 
@@ -126,6 +127,9 @@ class ClawBodyCore:
             enable_openclaw: Whether to enable OpenClaw integration
             robot: Optional pre-initialized robot (for app framework)
             external_stop_event: Optional external stop event
+            browser_bridge: Optional BrowserAudioBridge for Gradio WebRTC routing.
+                When provided, record_loop / play_loop check the bridge's routing
+                flags and yield to the browser when the corresponding toggle is ON.
         """
         from reachy_mini import ReachyMini
         from reachy_mini_openclaw.config import config
@@ -138,6 +142,7 @@ class ClawBodyCore:
         self.gateway_url = gateway_url
         self._external_stop_event = external_stop_event
         self._owns_robot = robot is None
+        self.browser_bridge = browser_bridge
 
         # Validate configuration
         errors = config.validate()
@@ -223,6 +228,11 @@ class ClawBodyCore:
             deps=self.deps,
             openclaw_bridge=self.openclaw_bridge,
         )
+
+        # Wire browser audio bridge to the handler so it can route audio.
+        # Must happen after the handler is created so the bridge holds a valid ref.
+        if browser_bridge is not None:
+            browser_bridge.attach_handler(self.handler)
 
         # State
         self._stop_event = asyncio.Event()
@@ -321,34 +331,68 @@ class ClawBodyCore:
         return False
 
     async def record_loop(self) -> None:
-        """Read audio from robot microphone and send to handler."""
+        """Read audio from robot microphone and send to handler.
+
+        Yields to the browser when browser mic routing is active — the
+        BrowserAudioBridge.receive() provides audio in that case, so we
+        simply pause this loop to avoid double-sourcing.
+        """
         input_sr = self.robot.media.get_input_audio_samplerate()
         logger.info("Recording at %d Hz", input_sr)
 
         while not self._should_stop():
+            # When browser mic is active, the WebRTC bridge feeds audio to the
+            # handler directly.  Skip the robot mic to keep sources exclusive.
+            if self.browser_bridge is not None and self.browser_bridge.routing.use_browser_mic:
+                await asyncio.sleep(0.01)
+                continue
+
             audio_frame = self.robot.media.get_audio_sample()
             if audio_frame is not None:
                 await self.handler.receive((input_sr, audio_frame))
             await asyncio.sleep(0.01)
 
     async def play_loop(self) -> None:
-        """Play audio from handler through robot speakers."""
+        """Play audio — routes to robot speaker OR browser based on live flag.
+
+        This loop is the **sole consumer** of handler.emit() so that the output
+        queue is never competed over.  When browser speaker is ON it forwards
+        each frame to the bridge's _browser_queue via call_soon_threadsafe
+        (the only safe way to put into a queue that lives in another event loop).
+        When OFF it plays directly on the robot.
+        """
         output_sr = self.robot.media.get_output_audio_samplerate()
         logger.info("Playing at %d Hz", output_sr)
 
         while not self._should_stop():
             output = await self.handler.emit()
-            if output is not None:
-                if isinstance(output, tuple):
-                    input_sr, audio_data = output
+            if output is None:
+                await asyncio.sleep(0.01)
+                continue
 
-                    # Convert to float32 and normalize (OpenAI sends int16)
+            if isinstance(output, tuple):
+                input_sr, audio_data = output
+
+                if (
+                    self.browser_bridge is not None
+                    and self.browser_bridge.routing.use_browser_speaker
+                    and self.browser_bridge.gradio_loop is not None
+                    and self.browser_bridge.gradio_loop.is_running()
+                ):
+                    # Route to browser: put into _browser_queue from ClawBodyCore's
+                    # thread using call_soon_threadsafe (the only safe cross-loop put).
+                    try:
+                        self.browser_bridge.gradio_loop.call_soon_threadsafe(
+                            self.browser_bridge._browser_queue.put_nowait,
+                            (input_sr, audio_data),
+                        )
+                    except Exception:
+                        pass  # Queue full or loop closed — drop frame silently
+                else:
+                    # Play on robot speaker
                     audio_data = audio_data.flatten().astype("float32") / 32768.0
-
-                    # Reduce volume to prevent distortion (0.5 = 50% volume)
                     audio_data = audio_data * 0.5
 
-                    # Resample if needed
                     if input_sr != output_sr:
                         from scipy.signal import resample
 
@@ -356,12 +400,17 @@ class ClawBodyCore:
                         audio_data = resample(audio_data, num_samples).astype("float32")
 
                     self.robot.media.push_audio_sample(audio_data)
-                # else: it's an AdditionalOutputs (transcript) - handle in UI mode
+            # else: AdditionalOutputs (transcript) — handled by UI
 
             await asyncio.sleep(0.01)
 
     async def run(self) -> None:
         """Run the main application loop."""
+        # Capture this loop so the browser bridge can schedule mic audio into it
+        # cross-thread via asyncio.run_coroutine_threadsafe.
+        if self.browser_bridge is not None:
+            self.browser_bridge.clawbody_loop = asyncio.get_event_loop()
+
         # Test OpenClaw connection
         if self.openclaw_bridge is not None:
             connected = await self.openclaw_bridge.connect()
@@ -369,6 +418,11 @@ class ClawBodyCore:
                 logger.info("OpenClaw gateway connected")
             else:
                 logger.warning("OpenClaw gateway not available - some features disabled")
+
+        # Ensure required speaches models are downloaded before starting audio
+        from reachy_mini_openclaw.speaches_setup import ensure_speaches_models
+
+        await ensure_speaches_models()
 
         # Enable motors and move to neutral pose
         logger.info("Enabling motors and moving to neutral position...")
@@ -459,6 +513,10 @@ class ClawBodyCore:
                 asyncio.get_event_loop().run_until_complete(self.openclaw_bridge.disconnect())
             except Exception as e:
                 logger.debug("OpenClaw disconnect: %s", e)
+
+        # Detach browser bridge so it stops routing to the now-dead handler
+        if self.browser_bridge is not None:
+            self.browser_bridge.detach_handler()
 
         # Close resources if we own them
         if self._owns_robot:

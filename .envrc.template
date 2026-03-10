@@ -5,49 +5,69 @@
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# vLLM
+# llama.cpp — build + runtime
+# Run ./init_models.sh once to download the GGUF files before starting the stack.
+# Build:   docker compose build model
+# Launch:  docker compose up model
 # ------------------------------------------------------------------------------
-export CONTAINER_NAME=vllm-openclaw-qwen3.5-35b-a3b-nvfp4
-export VLLM_IMAGE=vllm/vllm-openai
-export VLLM_IMAGE_TAG=v0.17.0-cu130
-export LOCAL_MODEL_PATH=/home/dell/genai/nvfp4-quant/output_models/saved_models_Qwen3_5-35B-A3B_nvfp4
-export LOCAL_MODEL_MOUNT_PATH=/models/local
-export MODEL_ID=/models/Qwen3_5-35B-A3B-nvfp4
-export TOKENIZER_ID=Qwen/Qwen3.5-35B-A3B
-export SERVED_MODEL_NAME=qwen3.5-35b-a3b-nvfp4
+
+# Docker image / build args
+export LLAMA_CPP_IMAGE=clawbody-llama-cpp:cuda13-sm121
+export CUDA_BASE_IMAGE=nvidia/cuda:13.0.0-devel-ubuntu24.04
+export CUDA_ARCHITECTURES=121        # sm_121 = RTX 50-series; sm_89 = RTX 40-series
+
+# Container
+export CONTAINER_NAME=llama-cpp-qwen3.5-35b-a3b
+
+# Model files (populated by ./init_models.sh into LOCAL_MODEL_PATH)
+export LOCAL_MODEL_PATH=~/models
+export MODEL_FILE=unsloth/Qwen3.5-35B-A3B-GGUF/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf
+export MMPROJ_FILE=unsloth/Qwen3.5-35B-A3B-GGUF/mmproj-F16.gguf
+export MODEL_ALIAS=unsloth/Qwen3.5-35B-A3B
+
+# Resources
 export HOST_PORT=8181
 export HOST_RAM_LIMIT=48g
-export GPU_MEMORY_UTILIZATION=0.65
-export MAX_MODEL_LEN=262144
-export MAX_NUM_SEQS=2
-export MAX_BATCHED_TOKENS=262144
-export KV_CACHE_DTYPE=fp8
 export GPU_COUNT=1
-export TENSOR_PARALLEL_SIZE=1
-export VLLM_ATTENTION_BACKEND=FLASHINFER
-export PRE_LAUNCH_CMD=
-export EXTRA_VLLM_ARGS="--reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder"
+
+# Inference knobs
+export N_GPU_LAYERS=999          # offload all layers to GPU
+export CTX_SIZE=131072           # 128k context
+export PARALLEL=4                # parallel decode slots
+export BATCH_SIZE=2048
+export UBATCH_SIZE=512
+export CACHE_TYPE_K=q4_0
+export CACHE_TYPE_V=q4_0
+
 export HF_TOKEN=$HF_TOKEN
 
 # ------------------------------------------------------------------------------
-# speaches
-# When vLLM is running locally (default): http://localhost:8181/v1
-# When vLLM is on kyber:                  http://kyber:8181/v1
+# speaches — STT/TTS/Realtime API
+# SPEACHES_HOST: hostname speaches binds to and is reachable at.
+#   Must be a real connectable address (not 0.0.0.0) — speaches <=v0.8.x
+#   constructs its internal loopback URL from this value.
+# Examples:
+#   export SPEACHES_HOST=beskar         # machine hostname (resolves via DNS/hosts)
+#   export SPEACHES_HOST=192.168.1.50   # machine's LAN IP
+#   export SPEACHES_HOST=localhost      # only if robot runs on the same machine
 # ------------------------------------------------------------------------------
-export CHAT_COMPLETION_BASE_URL=http://localhost:${HOST_PORT}/v1
-export CHAT_COMPLETION_API_KEY=dummy
+export SPEACHES_HOST=your-hostname-or-ip
 export SPEACHES_PORT=8233
+# URL speaches uses to forward chat completions to llama.cpp.
+# Update the hostname to wherever the model service is running.
+export CHAT_COMPLETION_BASE_URL=http://your-model-host:${HOST_PORT}/v1
+export CHAT_COMPLETION_API_KEY=dummy
 export SPEACHES_STT_MODEL=Systran/faster-distil-whisper-small.en
 export SPEACHES_TTS_MODEL=speaches-ai/Kokoro-82M-v1.0-ONNX
 
 # ------------------------------------------------------------------------------
 # clawbody — voice pipeline (points at speaches)
-# When speaches is running locally (default): http://localhost:8233
-# When speaches is on kyber:                  http://kyber:8233
+# SPEACHES_BASE_URL: where clawbody connects to speaches.
+# SPEACHES_REALTIME_MODEL: the model alias llama.cpp is serving.
 # ------------------------------------------------------------------------------
-export SPEACHES_BASE_URL=http://localhost:${SPEACHES_PORT}
+export SPEACHES_BASE_URL=http://${SPEACHES_HOST}:${SPEACHES_PORT}/v1
 export SPEACHES_API_KEY=speaches
-export SPEACHES_REALTIME_MODEL=${SERVED_MODEL_NAME}
+export SPEACHES_REALTIME_MODEL=${MODEL_ALIAS}
 export SPEACHES_VOICE=af_heart
 
 # ------------------------------------------------------------------------------
