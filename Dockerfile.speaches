@@ -1,0 +1,215 @@
+# =============================================================================
+# Dockerfile.speaches — speaches with CUDA-enabled ctranslate2 for aarch64
+#
+# The official ghcr.io/speaches-ai/speaches:latest-cuda image ships a
+# ctranslate2 wheel from PyPI that is CPU-only on aarch64 (~16 MB vs ~39 MB
+# for x86_64 which bundles cuBLAS/cuDNN).  Similarly, speaches' pyproject.toml
+# overrides onnxruntime-gpu → CPU onnxruntime on non-x86_64 platforms.
+#
+# This Dockerfile fixes both by:
+#   1. Building ctranslate2 from source with -DWITH_CUDA=ON -DWITH_CUDNN=ON
+#   2. Force-reinstalling onnxruntime-gpu (which has real aarch64 wheels)
+#
+# Targets: linux/arm64, NVIDIA GB10 Grace Blackwell (sm_121), CUDA 13.0
+#
+# Multi-stage layout:
+#   ct2-builder      — compiles ctranslate2 C++/CUDA → .whl (~15-25 min)
+#   speaches-builder — installs speaches deps via uv, swaps in CUDA wheels
+#   runtime          — slim cudnn-runtime image, no compiler toolchain
+#
+# Build:
+#   docker compose build speaches
+#   # or directly:
+#   docker build -f Dockerfile.speaches -t clawbody-speaches:cuda13-sm121 .
+# =============================================================================
+
+ARG CUDA_VERSION=13.0.0
+ARG UBUNTU_VERSION=ubuntu24.04
+ARG CUDA_ARCHITECTURES=121
+
+# Builder image needs the full CUDA + cuDNN dev stack (nvcc, headers, cuDNN dev)
+ARG BUILD_IMAGE=nvidia/cuda:${CUDA_VERSION}-cudnn-devel-${UBUNTU_VERSION}
+# Runtime image only needs the CUDA + cuDNN runtime (~1.9 GB smaller than devel)
+ARG RUNTIME_IMAGE=nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-${UBUNTU_VERSION}
+
+# =============================================================================
+# Stage 1: ct2-builder
+# Compile ctranslate2 from source with CUDA + cuDNN enabled on aarch64.
+# The resulting Python wheel is dropped into /wheels/ for later stages.
+# =============================================================================
+FROM ${BUILD_IMAGE} AS ct2-builder
+
+# ctranslate2 release to build — must satisfy speaches' requirement >=4.5.0
+ARG CT2_VERSION=v4.7.1
+ARG CUDA_ARCHITECTURES=121
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        build-essential \
+        cmake \
+        python3 \
+        python3-dev \
+        python3-pip \
+        python3-venv \
+        libopenblas-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# pybind11 needed by ctranslate2's Python bindings
+RUN pip3 install --break-system-packages pybind11
+
+WORKDIR /build
+
+RUN git clone --depth 1 --branch ${CT2_VERSION} \
+        https://github.com/OpenNMT/CTranslate2.git . \
+    && git submodule update --init --recursive
+
+# Stub libcuda.so.1 for linking at build time (no GPU required during build)
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so \
+           /usr/local/cuda/lib64/stubs/libcuda.so.1
+
+RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH} \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH} \
+    cmake -S . -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES} \
+        -DWITH_CUDA=ON \
+        -DWITH_CUDNN=ON \
+        -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda \
+        -DWITH_OPENBLAS=ON \
+        -DOPENBLAS_INCLUDE_DIRS=/usr/include/openblas \
+    && LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH} \
+       cmake --build build -j"$(nproc)"
+
+# Install the C++ library so the Python bindings can link against it
+RUN cmake --install build
+
+# Build the Python wheel into /wheels/
+RUN pip3 wheel . --wheel-dir=/wheels --no-deps --no-build-isolation
+
+# =============================================================================
+# Stage 2: speaches-builder
+# Clone speaches at the pinned release tag, install all Python deps via uv,
+# then swap ctranslate2 and onnxruntime with GPU-enabled builds.
+# =============================================================================
+FROM ${BUILD_IMAGE} AS speaches-builder
+
+# speaches release to pin — v0.9.0-rc.3 = commit 24f209c (latest as of 2026-01)
+ARG SPEACHES_VERSION=v0.9.0-rc.3
+# uv version matching what upstream speaches uses
+ARG UV_VERSION=0.8.22
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        python3 \
+        python3-dev \
+        python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# uv — copied from the official uv image (same approach as upstream speaches)
+COPY --from=ghcr.io/astral-sh/uv:0.8.22 /uv /bin/uv
+
+ENV UV_LINK_MODE=copy \
+    UV_PYTHON_PREFERENCE=system \
+    UV_COMPILE_BYTECODE=1
+
+WORKDIR /app
+
+RUN git clone --depth 1 --branch ${SPEACHES_VERSION} \
+        https://github.com/speaches-ai/speaches.git .
+
+# Pull ctranslate2 CUDA wheel from Stage 1
+COPY --from=ct2-builder /wheels/ /wheels/
+# Also copy the installed ctranslate2 C++ runtime so pip can link against it
+# at install time if needed (e.g. for shared library resolution checks)
+COPY --from=ct2-builder /usr/local/lib/ /usr/local/lib/
+COPY --from=ct2-builder /usr/local/include/ctranslate2/ /usr/local/include/ctranslate2/
+RUN ldconfig
+
+# ── Install speaches Python deps ─────────────────────────────────────────────
+# Two-pass uv sync (matches upstream speaches pattern for better layer caching):
+#   Pass 1: deps only (no project source) — slow, cached across source changes
+#   Pass 2: install the project itself — fast
+
+# Pass 1: sync dependencies only (no project code yet)
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-install-project --no-dev
+
+# Copy source, then sync again to install the project entry-points
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev
+
+# ── Swap in CUDA-enabled wheels ───────────────────────────────────────────────
+# Replace the CPU-only ctranslate2 PyPI wheel with our CUDA build from Stage 1.
+# We use pip (not uv) here so we can point at a local .whl without touching
+# the lock file.
+RUN /app/.venv/bin/pip install --force-reinstall --no-deps /wheels/ctranslate2*.whl
+
+# Replace CPU onnxruntime (installed by speaches' pyproject.toml override that
+# forces non-gpu on non-x86_64) with onnxruntime-gpu, which has real aarch64
+# wheels on PyPI with CUDA 12 cuDNN support (backward-compatible with CUDA 13).
+# --no-deps avoids pulling in a second onnxruntime alongside onnxruntime-gpu.
+RUN /app/.venv/bin/pip install --force-reinstall --no-deps "onnxruntime-gpu>=1.22.0"
+
+# =============================================================================
+# Stage 3: runtime
+# Slim production image — cudnn-runtime only, no compiler toolchain.
+# Drops ~3-4 GB of devel headers/nvcc/cuDNN dev headers from the final image.
+# =============================================================================
+FROM ${RUNTIME_IMAGE} AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Runtime system packages (matching upstream speaches)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Run as non-root user (uid 1000 = ubuntu on Ubuntu 24.04 images)
+USER ubuntu
+WORKDIR /home/ubuntu
+
+# Copy the fully-assembled Python virtualenv from the builder
+COPY --from=speaches-builder --chown=ubuntu:ubuntu /app/.venv /app/.venv
+# Copy speaches source (the entry-point scripts reference package files here)
+COPY --from=speaches-builder --chown=ubuntu:ubuntu /app /app
+
+# Copy the ctranslate2 C++ shared library so it's resolvable at runtime
+# (the runtime image doesn't have the devel layer that installed it)
+COPY --from=ct2-builder /usr/local/lib/libctranslate2.so* /usr/local/lib/
+USER root
+RUN ldconfig
+USER ubuntu
+
+# Activate the venv for all subsequent commands and the container process
+ENV VIRTUAL_ENV=/app/.venv
+ENV PATH="/app/.venv/bin:$PATH"
+
+# ── Environment variables ─────────────────────────────────────────────────────
+# Matching upstream speaches defaults
+ENV UVICORN_HOST=0.0.0.0
+ENV UVICORN_PORT=8000
+# Disable hf-transfer inside Docker — it causes download errors in this context
+ENV HF_HUB_ENABLE_HF_TRANSFER=0
+# Opt out of telemetry
+ENV DO_NOT_TRACK=1
+ENV GRADIO_ANALYTICS_ENABLED=False
+ENV DISABLE_TELEMETRY=1
+ENV HF_HUB_DISABLE_TELEMETRY=1
+
+EXPOSE 8000
+
+# Health probe
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
+    CMD curl -fsS http://localhost:${UVICORN_PORT}/health || exit 1
+
+ENTRYPOINT ["speaches"]

@@ -43,6 +43,9 @@ export HF_TOKEN=$HF_TOKEN
 
 # ------------------------------------------------------------------------------
 # speaches — STT/TTS/Realtime API
+# Built locally from Dockerfile.speaches with ctranslate2 compiled against CUDA.
+# Build:  docker compose build speaches   (first build ~20-30 min, cached after)
+#
 # SPEACHES_HOST: hostname speaches binds to and is reachable at.
 #   Must be a real connectable address (not 0.0.0.0) — speaches <=v0.8.x
 #   constructs its internal loopback URL from this value.
@@ -51,6 +54,12 @@ export HF_TOKEN=$HF_TOKEN
 #   export SPEACHES_HOST=192.168.1.50   # machine's LAN IP
 #   export SPEACHES_HOST=localhost      # only if robot runs on the same machine
 # ------------------------------------------------------------------------------
+
+# speaches build args (override to target a different CUDA version or speaches release)
+export SPEACHES_IMAGE=clawbody-speaches:cuda13-sm121
+export CUDA_VERSION=13.0.0           # must be <= driver CUDA version (GB10: 13.0.2)
+export SPEACHES_VERSION=v0.9.0-rc.3  # speaches release tag to clone and build
+
 export SPEACHES_HOST=your-hostname-or-ip
 export SPEACHES_PORT=8233
 # URL speaches uses to forward chat completions to llama.cpp.
