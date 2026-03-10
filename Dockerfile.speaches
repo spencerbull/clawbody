@@ -218,8 +218,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Run as non-root user (uid 1000 = ubuntu on Ubuntu 24.04 images)
+# WORKDIR must be /app — speaches uses relative paths (e.g. realtime-console/dist)
 USER ubuntu
-WORKDIR /home/ubuntu
+WORKDIR /app
 
 # Copy the fully-assembled Python virtualenv from the builder
 COPY --from=speaches-builder --chown=ubuntu:ubuntu /app/.venv /app/.venv
