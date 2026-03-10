@@ -71,16 +71,52 @@ RUN git clone --depth 1 --branch ${CT2_VERSION} \
 RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so \
            /usr/local/cuda/lib64/stubs/libcuda.so.1
 
+# ctranslate2 uses the old FindCUDA cmake API: cuda_select_nvcc_arch_flags().
+# That function lives in cmake 3.28's FindCUDA/select_compute_arch.cmake, which
+# was written before Blackwell and has no knowledge of sm_12.x.  When the build
+# container has no GPU, "Auto" detection falls back to a broad common list that
+# includes Maxwell sm_53, which CUDA 13.0 nvcc no longer supports.
+#
+# Fix: use Python to locate the cuda_select_nvcc_arch_flags() call across ALL
+# cmake files and replace it with a direct set() of the gencode flags for our
+# target architecture (sm_121).  This avoids the broken auto-detection entirely.
+RUN python3 - <<'PYEOF'
+import re, glob, os, sys
+
+arch = os.environ.get("CUDA_ARCHITECTURES", "121")
+replacement = f'set(NVCC_FLAGS_EXTRA "-gencode;arch=compute_{arch},code=sm_{arch}")'
+pattern = re.compile(r'cuda_select_nvcc_arch_flags\s*\([^)]*\)')
+
+patched = []
+for path in glob.glob("**/*.cmake", recursive=True) + ["CMakeLists.txt"]:
+    try:
+        text = open(path).read()
+    except Exception:
+        continue
+    new_text, n = pattern.subn(replacement, text)
+    if n:
+        open(path, "w").write(new_text)
+        patched.append(f"  {path}: replaced {n} occurrence(s)")
+
+if patched:
+    print("Patched cuda_select_nvcc_arch_flags in:")
+    print("\n".join(patched))
+else:
+    print("ERROR: cuda_select_nvcc_arch_flags not found in any cmake file!", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+
 RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH} \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH} \
     cmake -S . -B build \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES} \
         -DWITH_CUDA=ON \
         -DWITH_CUDNN=ON \
         -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda \
+        -DWITH_MKL=OFF \
         -DWITH_OPENBLAS=ON \
         -DOPENBLAS_INCLUDE_DIRS=/usr/include/openblas \
+        -DOPENMP_RUNTIME=COMP \
     && LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH} \
        cmake --build build -j"$(nproc)"
 
@@ -88,7 +124,8 @@ RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH} \
 RUN cmake --install build
 
 # Build the Python wheel into /wheels/
-RUN pip3 wheel . --wheel-dir=/wheels --no-deps --no-build-isolation
+# ctranslate2's Python bindings are in python/ (not the repo root)
+RUN pip3 wheel python/ --wheel-dir=/wheels --no-deps --no-build-isolation
 
 # =============================================================================
 # Stage 2: speaches-builder
@@ -149,14 +186,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # ── Swap in CUDA-enabled wheels ───────────────────────────────────────────────
 # Replace the CPU-only ctranslate2 PyPI wheel with our CUDA build from Stage 1.
 # We use pip (not uv) here so we can point at a local .whl without touching
-# the lock file.
-RUN /app/.venv/bin/pip install --force-reinstall --no-deps /wheels/ctranslate2*.whl
+    # the lock file.  uv venvs don't bundle pip, so use uv pip with explicit venv.
+    RUN VIRTUAL_ENV=/app/.venv uv pip install --force-reinstall --no-deps /wheels/ctranslate2*.whl
 
-# Replace CPU onnxruntime (installed by speaches' pyproject.toml override that
-# forces non-gpu on non-x86_64) with onnxruntime-gpu, which has real aarch64
-# wheels on PyPI with CUDA 12 cuDNN support (backward-compatible with CUDA 13).
-# --no-deps avoids pulling in a second onnxruntime alongside onnxruntime-gpu.
-RUN /app/.venv/bin/pip install --force-reinstall --no-deps "onnxruntime-gpu>=1.22.0"
+    # Replace CPU onnxruntime (installed by speaches' pyproject.toml override that
+    # forces non-gpu on non-x86_64) with onnxruntime-gpu, which has real aarch64
+    # wheels on PyPI with CUDA 12 cuDNN support (backward-compatible with CUDA 13).
+    # --no-deps avoids pulling in a second onnxruntime alongside onnxruntime-gpu.
+    RUN VIRTUAL_ENV=/app/.venv uv pip install --force-reinstall --no-deps "onnxruntime-gpu>=1.22.0"
 
 # =============================================================================
 # Stage 3: runtime
@@ -167,11 +204,17 @@ FROM ${RUNTIME_IMAGE} AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Runtime system packages (matching upstream speaches)
+# Runtime system packages
+# python3.12 is required because the uv venv symlinks point to /usr/bin/python3.12;
+# the base nvidia/cuda runtime image is minimal and ships no Python.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         ffmpeg \
+        python3.12 \
+        python3.12-venv \
+        libopenblas0 \
+        libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Run as non-root user (uid 1000 = ubuntu on Ubuntu 24.04 images)
@@ -212,4 +255,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
     CMD curl -fsS http://localhost:${UVICORN_PORT}/health || exit 1
 
-ENTRYPOINT ["speaches"]
+ENTRYPOINT ["uvicorn", "--factory", "speaches.main:create_app"]
