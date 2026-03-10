@@ -63,7 +63,14 @@ class Config:
     OPENCLAW_AGENT_ID: str = field(default_factory=lambda: os.getenv("OPENCLAW_AGENT_ID", "main"))
     # Session key for OpenClaw - uses "main" to share context with WhatsApp and other channels
     # Format: agent:<agent_id>:<session_key>, but we only need the session key part here
+    # NOTE: This is now only used for fallback/non-Gradio mode (Gradio generates unique session keys per session)
     OPENCLAW_SESSION_KEY: str = field(default_factory=lambda: os.getenv("OPENCLAW_SESSION_KEY", "main"))
+
+    # Robot Tool Server Configuration
+    ROBOT_TOOL_SERVER_PORT: int = field(default_factory=lambda: int(os.getenv("ROBOT_TOOL_SERVER_PORT", "8234")))
+    OPENCLAW_SESSION_KEY_PREFIX: str = field(
+        default_factory=lambda: os.getenv("OPENCLAW_SESSION_KEY_PREFIX", "reachy-gradio")
+    )
 
     # ---------------------------------------------------------------------------
     # Robot

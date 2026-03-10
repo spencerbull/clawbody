@@ -1,6 +1,6 @@
 ---
 name: clawbody
-description: Give your OpenClaw AI agent a physical robot body with Reachy Mini. Works with physical robot OR simulator! Voice conversation via OpenAI Realtime API, vision, and expressive movements.
+description: Give your OpenClaw AI agent a physical robot body with Reachy Mini. Works with physical robot OR simulator! Voice conversation powered by speaches (local STT + TTS) with OpenClaw as the primary intelligence.
 ---
 
 # ClawBody - Robot Body for OpenClaw
@@ -16,21 +16,40 @@ ClawBody embodies your OpenClaw AI assistant in a Reachy Mini robot, enabling it
 - **Speak**: Respond with natural voice through the robot's speaker
 - **Move**: Express emotions through expressive head movements and dances
 
-Using a hybrid architecture with OpenAI Realtime API for voice I/O and OpenClaw for intelligence, the robot responds with sub-second latency for natural conversation.
+OpenClaw is the **primary intelligence** — all conversation, memory, and tool use flows through the OpenClaw gateway. speaches handles local STT (Whisper) and TTS (Kokoro) only.
 
 ## Architecture
 
 ```
-You speak → Reachy Mini 🎤
+You speak → Reachy Mini mic
                 ↓
-       OpenAI Realtime API
-    (speech recognition + TTS)
+        speaches (local)
+      VAD + STT (Whisper)
                 ↓
         OpenClaw Gateway
-      (Clawson's brain 🦞)
+      (Clawson's brain — primary AI)
+                ↓ (text response)
+        speaches HTTP TTS
+           (Kokoro)
                 ↓
-   Robot speaks & moves 🤖💃
+   Robot speaks & moves
 ```
+
+## Robot Tool Webhooks
+
+OpenClaw controls robot movements by calling webhook endpoints on the RobotToolServer (port 8234 by default). Configure the following tools in your OpenClaw agent to point at `http://<robot-ip>:8234/tools/<name>`:
+
+| Tool | Endpoint | Description |
+|------|----------|-------------|
+| `look` | `POST http://localhost:8234/tools/look` | Move robot head to look at a direction |
+| `emotion` | `POST http://localhost:8234/tools/emotion` | Express an emotion (happy, curious, thinking, excited) |
+| `dance` | `POST http://localhost:8234/tools/dance` | Perform a dance animation |
+| `camera` | `POST http://localhost:8234/tools/camera` | Capture a photo from the robot camera |
+| `face_tracking` | `POST http://localhost:8234/tools/face_tracking` | Enable/disable face tracking |
+| `stop_moves` | `POST http://localhost:8234/tools/stop_moves` | Stop all current movements |
+| `idle` | `POST http://localhost:8234/tools/idle` | Enter idle/resting state |
+
+Health check: `GET http://localhost:8234/health`
 
 ## Requirements
 

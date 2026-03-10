@@ -1,8 +1,9 @@
 """ClawBody - Give your OpenClaw AI agent a physical robot body.
 
 This module provides the main application that connects:
-- OpenAI Realtime API for voice I/O (speech recognition + TTS)
-- OpenClaw Gateway for AI intelligence (Clawson's brain)
+- speaches for local STT (Whisper) and TTS (Kokoro)
+- OpenClaw Gateway as PRIMARY AI intelligence (web, calendar, smart home, etc.)
+- RobotToolServer for webhook-based tool calls from OpenClaw
 - Reachy Mini robot for physical embodiment
 
 Usage:
@@ -117,6 +118,7 @@ class ClawBodyCore:
         robot: Optional["ReachyMini"] = None,
         external_stop_event: Optional[threading.Event] = None,
         browser_bridge: Optional[Any] = None,
+        session_key: Optional[str] = None,
     ):
         """Initialize the application.
 
@@ -130,6 +132,7 @@ class ClawBodyCore:
             browser_bridge: Optional BrowserAudioBridge for Gradio WebRTC routing.
                 When provided, record_loop / play_loop check the bridge's routing
                 flags and yield to the browser when the corresponding toggle is ON.
+            session_key: Optional unique session key for this Gradio session
         """
         from reachy_mini import ReachyMini
         from reachy_mini_openclaw.config import config
@@ -185,6 +188,7 @@ class ClawBodyCore:
             self.openclaw_bridge = OpenClawBridge(
                 gateway_url=gateway_url,
                 gateway_token=config.OPENCLAW_TOKEN,
+                session_key=session_key,
             )
 
         # Camera worker for video streaming and frame capture
@@ -237,6 +241,7 @@ class ClawBodyCore:
         # State
         self._stop_event = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
+        self.tool_server = None
 
     def _initialize_vision_manager(self) -> Optional[Any]:
         """Initialize local vision processor (SmolVLM2).
@@ -473,11 +478,19 @@ class ClawBodyCore:
         # Start OpenAI handler in background
         handler_task = asyncio.create_task(self.handler.start_up(), name="openai-handler")
 
+        # Start robot tool server for OpenClaw webhook callbacks
+        from reachy_mini_openclaw.tools.robot_server import RobotToolServer
+        from reachy_mini_openclaw.config import config as app_config
+
+        self.tool_server = RobotToolServer(deps=self.deps, port=app_config.ROBOT_TOOL_SERVER_PORT)
+        logger.info("Robot tool server starting on port %d", app_config.ROBOT_TOOL_SERVER_PORT)
+
         # Start audio loops
         self._tasks = [
             handler_task,
             asyncio.create_task(self.record_loop(), name="record-loop"),
             asyncio.create_task(self.play_loop(), name="play-loop"),
+            asyncio.create_task(self.tool_server.run(), name="robot-tool-server"),
         ]
 
         try:
@@ -506,6 +519,13 @@ class ClawBodyCore:
         # Stop camera worker
         if self.camera_worker is not None:
             self.camera_worker.stop()
+
+        # Stop tool server
+        if hasattr(self, "tool_server") and self.tool_server is not None:
+            try:
+                asyncio.get_event_loop().run_until_complete(self.tool_server.stop())
+            except Exception as e:
+                logger.debug("Tool server stop: %s", e)
 
         # Disconnect OpenClaw bridge
         if self.openclaw_bridge is not None:
