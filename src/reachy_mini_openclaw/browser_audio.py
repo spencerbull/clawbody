@@ -29,11 +29,23 @@ Cross-loop communication:
                _main_handler.receive() into ClawBodyCore's loop via
                asyncio.run_coroutine_threadsafe(), which queues the coroutine
                safely in the target loop. ✓
+
+State sharing between copies:
+    fastrtc calls copy() on the bridge for each new WebRTC peer connection.
+    All mutable state that must be consistent across all copies (handler ref,
+    event loops, routing flags, output queue) is kept in a single _SharedState
+    object that every copy references.  This means attach_handler(),
+    clawbody_loop assignment, and routing toggles all affect every active copy
+    automatically.
+
+    gradio_loop is captured lazily inside emit() rather than at __init__ time
+    so we always get the actual running Gradio event loop, not whatever loop
+    happened to be current when BrowserAudioBridge was first constructed.
 """
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional, Tuple
 
 import numpy as np
@@ -54,7 +66,7 @@ _BROWSER_QUEUE_MAXSIZE = 30
 
 @dataclass
 class RoutingState:
-    """Shared mutable routing flags.
+    """Live-switchable routing flags.
 
     A single instance is shared across all copies of BrowserAudioBridge so
     that Gradio toggle callbacks always affect the active WebRTC session
@@ -65,12 +77,36 @@ class RoutingState:
     use_browser_speaker: bool = False
 
 
+@dataclass
+class _SharedState:
+    """All mutable state that must be consistent across every copy of the bridge.
+
+    fastrtc calls copy() whenever it needs a fresh handler for a new WebRTC
+    peer.  Because the copy is made before ClawBodyCore has started (and
+    therefore before clawbody_loop / _main_handler are set), copies must
+    reference this shared object rather than snapshotting scalar attributes
+    at copy time.
+    """
+
+    routing: RoutingState = field(default_factory=RoutingState)
+    main_handler: Optional[Any] = None
+    # gradio_loop is captured lazily inside emit() — not at __init__ time —
+    # because Gradio's event loop may not be running yet when the bridge is
+    # first constructed.
+    gradio_loop: Optional[asyncio.AbstractEventLoop] = None
+    # clawbody_loop is set by ClawBodyCore.run() once its event loop starts.
+    clawbody_loop: Optional[asyncio.AbstractEventLoop] = None
+    # The output queue lives in Gradio's event loop.
+    # play_loop() writes via call_soon_threadsafe; emit() reads directly.
+    browser_queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=_BROWSER_QUEUE_MAXSIZE))
+
+
 class BrowserAudioBridge(AsyncStreamHandler):
     """fastrtc AsyncStreamHandler that bridges the browser WebRTC session to
     the main OpenAIRealtimeHandler.
 
     Lifecycle:
-        1. Create once in launch_gradio() (runs in Gradio's event loop):
+        1. Create once in launch_gradio() (before demo.launch()):
                bridge = BrowserAudioBridge()
         2. Wire to gr.WebRTC():
                webrtc.stream(fn=bridge, inputs=[webrtc], outputs=[webrtc])
@@ -79,42 +115,45 @@ class BrowserAudioBridge(AsyncStreamHandler):
            ClawBodyCore calls bridge.attach_handler(core.handler) and, when
            its async run() starts, sets bridge.clawbody_loop.
         4. Toggle checkboxes update bridge.routing.use_browser_mic /
-           bridge.routing.use_browser_speaker live.
-
-    Cross-loop design:
-        _browser_queue lives in Gradio's event loop.
-            • emit() reads from it (Gradio's loop) ✓
-            • play_loop() writes via call_soon_threadsafe (ClawBodyCore→Gradio) ✓
-
-        _main_handler.receive() lives in ClawBodyCore's event loop.
-            • receive() schedules it via run_coroutine_threadsafe (Gradio→ClawBodyCore) ✓
+           bridge.routing.use_browser_speaker live — all copies are affected
+           because they share the same _SharedState.
     """
 
-    def __init__(self, routing: Optional[RoutingState] = None) -> None:
+    def __init__(self, shared: Optional[_SharedState] = None) -> None:
         super().__init__(
             expected_layout="mono",
             output_sample_rate=_SAMPLE_RATE,
             input_sample_rate=_SAMPLE_RATE,
         )
-        self.routing: RoutingState = routing if routing is not None else RoutingState()
-        self._main_handler: Optional[Any] = None
+        self._shared: _SharedState = shared if shared is not None else _SharedState()
 
-        # Gradio's event loop — captured at creation time.  Used by play_loop()
-        # (ClawBodyCore thread) to safely schedule puts onto _browser_queue.
-        try:
-            self.gradio_loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_event_loop()
-        except RuntimeError:
-            self.gradio_loop = None
+    # ------------------------------------------------------------------
+    # Convenience properties — delegate to shared state
+    # ------------------------------------------------------------------
 
-        # ClawBodyCore's event loop — set by ClawBodyCore.run() at startup.
-        # Used by receive() (Gradio thread) to safely schedule mic audio into
-        # the handler's speaches WebSocket.
-        self.clawbody_loop: Optional[asyncio.AbstractEventLoop] = None
+    @property
+    def routing(self) -> RoutingState:
+        return self._shared.routing
 
-        # Speaker output queue that lives in Gradio's event loop.
-        # play_loop() writes here (via call_soon_threadsafe);
-        # emit() reads here (Gradio's loop, same loop as the queue).
-        self._browser_queue: asyncio.Queue = asyncio.Queue(maxsize=_BROWSER_QUEUE_MAXSIZE)
+    @property
+    def gradio_loop(self) -> Optional[asyncio.AbstractEventLoop]:
+        return self._shared.gradio_loop
+
+    @gradio_loop.setter
+    def gradio_loop(self, loop: Optional[asyncio.AbstractEventLoop]) -> None:
+        self._shared.gradio_loop = loop
+
+    @property
+    def clawbody_loop(self) -> Optional[asyncio.AbstractEventLoop]:
+        return self._shared.clawbody_loop
+
+    @clawbody_loop.setter
+    def clawbody_loop(self, loop: Optional[asyncio.AbstractEventLoop]) -> None:
+        self._shared.clawbody_loop = loop
+
+    @property
+    def _browser_queue(self) -> asyncio.Queue:
+        return self._shared.browser_queue
 
     # ------------------------------------------------------------------
     # Public API called by ClawBodyCore
@@ -122,17 +161,17 @@ class BrowserAudioBridge(AsyncStreamHandler):
 
     def attach_handler(self, handler: Any) -> None:
         """Wire the bridge to the live OpenAIRealtimeHandler."""
-        self._main_handler = handler
+        self._shared.main_handler = handler
         logger.info("BrowserAudioBridge: attached to OpenAIRealtimeHandler")
 
     def detach_handler(self) -> None:
         """Remove the handler reference (called on Stop)."""
-        self._main_handler = None
-        self.clawbody_loop = None
+        self._shared.main_handler = None
+        self._shared.clawbody_loop = None
         # Drain the browser queue so stale audio doesn't play on reconnect
-        while not self._browser_queue.empty():
+        while not self._shared.browser_queue.empty():
             try:
-                self._browser_queue.get_nowait()
+                self._shared.browser_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
         logger.info("BrowserAudioBridge: detached from handler")
@@ -142,19 +181,14 @@ class BrowserAudioBridge(AsyncStreamHandler):
     # ------------------------------------------------------------------
 
     def copy(self) -> "BrowserAudioBridge":
-        """Return a new bridge sharing the same state as this one.
+        """Return a new bridge sharing the same _SharedState as this one.
 
         fastrtc calls copy() when it needs a fresh handler for a new WebRTC
-        peer connection.  We share RoutingState, handler ref, loops, and the
-        _browser_queue so toggle callbacks and play_loop() affect whichever
-        copy is currently active.
+        peer connection.  All copies share the same _SharedState, so any
+        update (attach_handler, clawbody_loop, routing toggles) is immediately
+        visible to whichever copy is currently active.
         """
-        new = BrowserAudioBridge(routing=self.routing)
-        new._main_handler = self._main_handler
-        new.gradio_loop = self.gradio_loop
-        new.clawbody_loop = self.clawbody_loop
-        new._browser_queue = self._browser_queue
-        return new
+        return BrowserAudioBridge(shared=self._shared)
 
     async def receive(self, frame: Tuple[int, NDArray]) -> None:
         """Called by fastrtc with audio from the browser microphone.
@@ -163,17 +197,18 @@ class BrowserAudioBridge(AsyncStreamHandler):
         (which interacts with the speaches WebSocket owned by ClawBodyCore's
         loop), we schedule it via run_coroutine_threadsafe.
         """
-        if not self.routing.use_browser_mic:
+        if not self._shared.routing.use_browser_mic:
             return
-        if self._main_handler is None:
+        if self._shared.main_handler is None:
             return
-        if self.clawbody_loop is None or not self.clawbody_loop.is_running():
+        clawbody_loop = self._shared.clawbody_loop
+        if clawbody_loop is None or not clawbody_loop.is_running():
             return
 
         try:
             asyncio.run_coroutine_threadsafe(
-                self._main_handler.receive(frame, source="browser"),
-                self.clawbody_loop,
+                self._shared.main_handler.receive(frame, source="browser"),
+                clawbody_loop,
             )
         except Exception as exc:
             logger.debug("BrowserAudioBridge.receive: failed to schedule: %s", exc)
@@ -181,18 +216,24 @@ class BrowserAudioBridge(AsyncStreamHandler):
     async def emit(self) -> Tuple[int, NDArray[np.int16]] | AdditionalOutputs | None:
         """Called by fastrtc to get the next audio frame for the browser speaker.
 
-        Runs in Gradio's event loop.  Reads from _browser_queue, which
-        play_loop() writes to via call_soon_threadsafe (cross-loop safe).
+        Runs in Gradio's event loop.  Lazily captures the running event loop
+        on first call so play_loop() (ClawBodyCore thread) can safely cross
+        into Gradio's loop via call_soon_threadsafe.
 
         When browser speaker is OFF, or when the queue is empty, returns a
-        silence frame to keep the WebRTC audio track alive.  The 20 ms sleep
-        paces silence production so the internal fastrtc playback queue
-        doesn't grow unboundedly.
+        silence frame to keep the WebRTC audio track alive.
         """
-        if self.routing.use_browser_speaker:
+        # Lazily capture Gradio's event loop — this is the only reliable
+        # place to do it because we're guaranteed to be inside Gradio's loop.
+        if self._shared.gradio_loop is None:
+            self._shared.gradio_loop = asyncio.get_running_loop()
+
+        if self._shared.routing.use_browser_speaker:
             try:
-                # Wait up to one frame duration for real audio
-                item = await asyncio.wait_for(self._browser_queue.get(), timeout=_SILENCE_SAMPLES / _SAMPLE_RATE)
+                item = await asyncio.wait_for(
+                    self._shared.browser_queue.get(),
+                    timeout=_SILENCE_SAMPLES / _SAMPLE_RATE,
+                )
                 if item is not None:
                     return item
             except asyncio.TimeoutError:

@@ -1,21 +1,25 @@
-"""ClawBody - Voice pipeline handler via speaches (OpenAI-compatible Realtime API).
+"""ClawBody - Voice pipeline handler via speaches (STT + VAD only).
 
 This module implements ClawBody's voice conversation system using speaches as a
-local, OpenAI-compatible Realtime API endpoint.  Speaches handles:
-  - Speech-to-text (faster-whisper)
-  - Text-to-speech (Kokoro / Piper)
-  - VAD (server-side voice activity detection)
-  - Chat completion relay → your vLLM instance (configured on the speaches side)
+local, OpenAI-compatible Realtime API endpoint. The architecture has changed:
 
-OpenClaw is the actual AI brain; this module is purely the voice I/O layer.
+**Before**: speaches Realtime API (STT + local vLLM + TTS) with OpenClaw as an optional tool call
+**After**: speaches Realtime API (STT + VAD ONLY, NO LLM) → OpenClaw (all intelligence) → speaches HTTP TTS
 
-Architecture:
-    Startup: Fetch OpenClaw agent context (personality, memories, user info)
-    Runtime: User speaks -> speaches Realtime (STT + vLLM + TTS) -> Robot speaks
-             -> Tools for movements + OpenClaw queries for extended capabilities
-             -> Conversations synced back to OpenClaw for memory continuity
+Key change: set `turn_detection.create_response = False` in the speaches session.
+This makes speaches do VAD and STT but NOT automatically call the LLM or generate TTS.
+We get transcription events but no response generation.
 
-The robot IS the OpenClaw agent - same personality, same memories, same context.
+Flow:
+    Audio in → speaches Realtime WS (VAD + STT)
+             → conversation.item.input_audio_transcription.completed event
+             → _handle_transcript(transcript_text)
+                → openclaw_bridge.chat(transcript, image_b64=None, deliver=False)
+                → collect full OpenClaw response text
+                → POST to speaches /v1/audio/speech (HTTP, Kokoro TTS)
+                → decode PCM audio bytes
+                → push to output_queue for playback
+                → push AdditionalOutputs(user transcript + assistant response) for UI
 """
 
 import json
@@ -23,8 +27,7 @@ import base64
 import random
 import asyncio
 import logging
-from typing import Any, Final, Literal, Optional, Tuple
-from datetime import datetime
+from typing import Any, Final, Literal, Optional, Tuple, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -32,63 +35,25 @@ from openai import AsyncOpenAI
 from fastrtc import AdditionalOutputs, AsyncStreamHandler, wait_for_item
 from scipy.signal import resample
 from websockets.exceptions import ConnectionClosedError
+import httpx
 
 from reachy_mini_openclaw.config import config
-from reachy_mini_openclaw.prompts import get_session_voice
-from reachy_mini_openclaw.tools.core_tools import ToolDependencies, get_tool_specs, dispatch_tool_call
+from reachy_mini_openclaw.tools.core_tools import ToolDependencies
 
 logger = logging.getLogger(__name__)
 
 # OpenAI Realtime API audio format
 OPENAI_SAMPLE_RATE: Final[Literal[24000]] = 24000
 
-# Base instructions for the robot body capabilities
-ROBOT_BODY_INSTRUCTIONS = """
-## Your Robot Body (Reachy Mini)
-You are currently embodied in a Reachy Mini robot. You have physical capabilities:
-
-**Movement Tools (use these naturally during conversation):**
-- `look` - Move head to look left, right, up, down, or front (center)
-- `emotion` - Express emotions through movement: happy, sad, surprised, curious, thinking, confused, excited
-- `dance` - Dance to celebrate or express joy
-- `camera` - Capture what you see through your camera
-
-**How to Use Your Body:**
-- Look around while thinking or to emphasize points
-- Express emotions that match what you're saying
-- Dance when celebrating good news
-- Use the camera when asked "what do you see?"
-- Reference your body naturally ("let me look", "I can see...")
-
-**Conversation Style for Voice:**
-- Keep responses concise - you're speaking out loud, not typing
-- Use natural speech patterns ("hmm", "well", "let me see")
-- Be warm, personable, and conversational
-
-**Extended Capabilities (via ask_openclaw tool):**
-For things requiring your full capabilities, use ask_openclaw:
-- Calendar, weather, news lookups
-- Web searches
-- Smart home control
-- Accessing detailed memories
-- Any task needing external tools
-"""
-
-# Fallback if OpenClaw context fetch fails
-FALLBACK_IDENTITY = """You are Clawson, the OpenClaw AI assistant. You're a friendly, helpful space lobster 🦞 who loves helping people. You're warm, occasionally witty, and genuinely care about being useful.
-
-You speak as yourself - not as "an AI assistant" but as Clawson, with your own personality and warmth."""
-
 
 class OpenAIRealtimeHandler(AsyncStreamHandler):
-    """Handler for OpenAI Realtime API embodying the OpenClaw agent.
+    """Handler for OpenAI Realtime API using speaches for VAD + STT only.
 
     This handler:
-    - Fetches OpenClaw's personality and context at startup
-    - Maintains voice conversation AS the OpenClaw agent
-    - Executes robot movement tools locally for low latency
-    - Calls OpenClaw for extended capabilities (web, calendar, memory)
-    - Syncs conversations back to OpenClaw for memory continuity
+    - Uses speaches Realtime API for voice activity detection and speech-to-text
+    - Sends all transcripts to OpenClaw for intelligence and response generation
+    - Uses speaches HTTP TTS endpoint to convert OpenClaw responses to speech
+    - Handles robot movement and audio playback
     """
 
     def __init__(
@@ -127,13 +92,6 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
         self._speaking = False  # True when robot is speaking
         self._last_no_connection_warn = 0.0  # Throttle "not connected" warnings
 
-        # OpenClaw agent context (fetched at startup)
-        self._agent_context: Optional[str] = None
-
-        # Conversation tracking for sync
-        self._last_user_message: Optional[str] = None
-        self._last_assistant_response: Optional[str] = None
-
         # Lifecycle flags
         self._shutdown_requested = False
         self._connected_event = asyncio.Event()
@@ -141,48 +99,13 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
         # Mic gating — prevent TTS audio from feeding back into the microphone.
         # _speaking is True while the robot is generating/playing a response.
         # _speaking_until is a grace-period timestamp: we keep the mic gated for
-        # 1 second after response.done to let buffered TTS audio finish draining
+        # 1 second after response completion to let buffered TTS audio finish draining
         # out of the output queue before we start accepting mic input again.
         self._speaking_until: float = 0.0
 
     def copy(self) -> "OpenAIRealtimeHandler":
         """Create a copy of the handler (required by fastrtc)."""
         return OpenAIRealtimeHandler(self.deps, self.openclaw_bridge, self.gradio_mode)
-
-    def _build_tools(self) -> list[dict]:
-        """Build the tool list for the session."""
-        tools = []
-
-        # Robot movement tools (executed locally)
-        for spec in get_tool_specs():
-            tools.append(spec)
-
-        # OpenClaw query tool (for extended capabilities)
-        if self.openclaw_bridge is not None:
-            tools.append(
-                {
-                    "type": "function",
-                    "name": "ask_openclaw",
-                    "description": """Query OpenClaw for information or actions requiring external tools.
-Use this for: weather, calendar, web searches, news, smart home control, 
-accessing conversation memory, or any task needing external data/tools.
-OpenClaw has access to many capabilities you don't have directly.""",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string", "description": "The question or request to send to OpenClaw"},
-                            "include_image": {
-                                "type": "boolean",
-                                "description": "Whether to include current camera image (for 'what do you see' queries)",
-                                "default": False,
-                            },
-                        },
-                        "required": ["query"],
-                    },
-                }
-            )
-
-        return tools
 
     async def start_up(self) -> None:
         """Start the handler and connect to speaches."""
@@ -264,46 +187,31 @@ OpenClaw has access to many capabilities you don't have directly.""",
         model = config.SPEACHES_REALTIME_MODEL
         logger.info("Connecting to speaches Realtime API at %s (model: %s)", config.SPEACHES_BASE_URL, model)
 
-        # Fetch OpenClaw agent context (personality, memories, user info)
-        system_instructions = await self._build_system_instructions()
+        if not self.client:
+            raise RuntimeError("OpenAI client not initialized")
 
         async with self.client.beta.realtime.connect(model=model) as conn:
-            # Configure session with OpenClaw's identity + robot body capabilities
-            tools = self._build_tools()
-
-            await conn.session.update(
-                session={
-                    "modalities": ["text", "audio"],
-                    "instructions": system_instructions,
-                    # speaches extension: selects the TTS model (Kokoro / Piper).
-                    # Without this, speaches falls back to its hardcoded default
-                    # ("speaches-ai/Kokoro-82M-v1.0-ONNX") regardless of SPEACHES_TTS_MODEL.
-                    "speech_model": config.SPEACHES_TTS_MODEL,
-                    "voice": get_session_voice(),
-                    # Note: input_audio_format / output_audio_format are NOT sent —
-                    # speaches rejects them ("not configurable").  It always uses pcm16
-                    # internally so this is fine.
-                    "input_audio_transcription": {
-                        # speaches requires the model name to route the transcription
-                        # request to the correct STT backend.  Without it, speaches
-                        # constructs the backend URL with "None" as the model name
-                        # (e.g. http://host/v1/None/v1/audio/transcriptions → 404).
-                        "model": config.SPEACHES_STT_MODEL,
-                    },
-                    "turn_detection": {
-                        "type": "server_vad",
-                        # 0.7 is more conservative than the speaches default (0.5).
-                        # This reduces false positives from ambient noise / breathing,
-                        # which is a secondary defense against empty-transcript crashes.
-                        "threshold": 0.7,
-                        "prefix_padding_ms": 300,
-                        "silence_duration_ms": 600,
-                    },
-                    "tools": tools,
-                    "tool_choice": "auto",
+            # Configure session for VAD + STT only (no LLM response generation)
+            # Using speaches-specific extensions like speech_model and create_response
+            session_config: Any = {
+                "modalities": ["text", "audio"],
+                # Minimal instructions - speaches LLM won't run but speaches may still need this
+                "instructions": "You are a speech transcription service.",
+                "speech_model": config.SPEACHES_TTS_MODEL,
+                "voice": config.SPEACHES_VOICE,  # keep voice config, may affect something
+                "input_audio_transcription": {
+                    "model": config.SPEACHES_STT_MODEL,
                 },
-            )
-            logger.info("speaches Realtime session configured with %d tools", len(tools))
+                "turn_detection": {
+                    "type": "server_vad",
+                    "threshold": 0.7,
+                    "silence_duration_ms": 600,
+                    "create_response": False,  # KEY CHANGE: disable auto LLM response
+                },
+                # No tools, no tool_choice
+            }
+            await conn.session.update(session=cast(Any, session_config))
+            logger.info("speaches Realtime session configured for VAD + STT only")
 
             self.connection = conn
             self._connected_event.set()
@@ -312,30 +220,121 @@ OpenClaw has access to many capabilities you don't have directly.""",
             async for event in conn:
                 await self._handle_event(event)
 
-    async def _build_system_instructions(self) -> str:
-        """Build system instructions by fetching OpenClaw's context.
+    async def _handle_transcript(self, transcript: str) -> None:
+        """Handle a completed transcript: query OpenClaw, then TTS the response."""
+        if not transcript.strip():
+            return
 
-        Returns:
-            Complete system instructions combining OpenClaw identity + robot capabilities
+        logger.info("User: %s", transcript)
+
+        # Push user transcript to UI
+        await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
+
+        # Signal "thinking" state
+        self.deps.movement_manager.set_processing(True)
+
+        if not self.openclaw_bridge or not self.openclaw_bridge.is_connected:
+            logger.warning("OpenClaw not connected, cannot respond")
+            self.deps.movement_manager.set_processing(False)
+            return
+
+        try:
+            # Query OpenClaw - this is now the PRIMARY intelligence
+            response = await self.openclaw_bridge.chat(
+                transcript,
+                deliver=False,
+            )
+
+            if response.error:
+                logger.error("OpenClaw error: %s", response.error)
+                self.deps.movement_manager.set_processing(False)
+                return
+
+            response_text = response.content
+            if not response_text:
+                self.deps.movement_manager.set_processing(False)
+                return
+
+            logger.info("Assistant: %s", response_text[:100] if len(response_text) > 100 else response_text)
+
+            # TTS via speaches HTTP endpoint
+            audio_frames = await self._text_to_speech(response_text)
+
+            self._speaking = True
+            self.deps.movement_manager.set_processing(False)
+
+            # Push audio frames to output queue
+            for frame in audio_frames:
+                if self.deps.head_wobbler is not None:
+                    # Feed raw int16 bytes b64-encoded for head wobbler compatibility
+                    audio_b64 = base64.b64encode(frame.tobytes()).decode("utf-8")
+                    self.deps.head_wobbler.feed(audio_b64)
+                await self.output_queue.put((OPENAI_SAMPLE_RATE, frame.reshape(1, -1)))
+
+            # Push assistant transcript to UI
+            await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": response_text}))
+
+            self._speaking = False
+            self._speaking_until = asyncio.get_event_loop().time() + 1.0
+            if self.deps.head_wobbler is not None:
+                self.deps.head_wobbler.reset()
+
+        except Exception as e:
+            logger.error("Error handling transcript: %s", e, exc_info=True)
+            self._speaking = False
+            self.deps.movement_manager.set_processing(False)
+
+    async def _text_to_speech(self, text: str) -> list[np.ndarray]:
+        """Convert text to speech via speaches HTTP TTS endpoint.
+
+        Returns list of numpy int16 arrays (PCM16 at 24kHz).
         """
-        # Try to fetch context from OpenClaw
-        agent_context = None
-        if self.openclaw_bridge and self.openclaw_bridge.is_connected:
-            logger.info("Fetching agent context from OpenClaw...")
-            agent_context = await self.openclaw_bridge.get_agent_context()
+        tts_url = f"{config.SPEACHES_BASE_URL}/audio/speech"
 
-        if agent_context:
-            self._agent_context = agent_context
-            logger.info("Using OpenClaw agent context (%d chars)", len(agent_context))
-            # Combine OpenClaw's identity/context with robot body instructions
-            return f"""{agent_context}
+        payload = {
+            "model": config.SPEACHES_TTS_MODEL,
+            "input": text,
+            "voice": config.SPEACHES_VOICE,
+            "response_format": "pcm",  # raw PCM16
+            "sample_rate": OPENAI_SAMPLE_RATE,  # 24000
+        }
 
-{ROBOT_BODY_INSTRUCTIONS}"""
-        else:
-            logger.warning("Could not fetch OpenClaw context, using fallback identity")
-            return f"""{FALLBACK_IDENTITY}
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    tts_url,
+                    json=payload,
+                    headers={"Authorization": f"Bearer {config.SPEACHES_API_KEY}"},
+                )
+                response.raise_for_status()
 
-{ROBOT_BODY_INSTRUCTIONS}"""
+                # Response is raw PCM16 bytes
+                pcm_bytes = response.content
+
+                if not pcm_bytes:
+                    logger.warning("TTS returned empty audio")
+                    return []
+
+                # Convert to numpy int16
+                audio_int16 = np.frombuffer(pcm_bytes, dtype=np.int16)
+
+                # Split into chunks of ~20ms (480 samples at 24kHz) for streaming playback
+                chunk_size = 480
+                chunks = []
+                for i in range(0, len(audio_int16), chunk_size):
+                    chunk = audio_int16[i : i + chunk_size]
+                    if len(chunk) > 0:
+                        chunks.append(chunk)
+
+                logger.debug("TTS produced %d audio chunks (%d total samples)", len(chunks), len(audio_int16))
+                return chunks
+
+        except httpx.HTTPStatusError as e:
+            logger.error("TTS HTTP error %d: %s", e.response.status_code, e.response.text[:200])
+            return []
+        except Exception as e:
+            logger.error("TTS failed: %s", e)
+            return []
 
     async def _handle_event(self, event: Any) -> None:
         """Handle an event from the OpenAI Realtime API."""
@@ -360,65 +359,12 @@ OpenClaw has access to many capabilities you don't have directly.""",
             self.deps.movement_manager.set_listening(False)
             logger.info("User stopped speaking")
 
-        # Transcription (for logging, UI, and sync)
+        # Transcription completed — this is now the MAIN trigger for conversation
         if event_type == "conversation.item.input_audio_transcription.completed":
             transcript = event.transcript
             if transcript and transcript.strip():
-                logger.info("User: %s", transcript)
-                self._last_user_message = transcript  # Track for sync
-                await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
-
-        # Response started - robot is about to speak
-        if event_type == "response.created":
-            self._speaking = True
-            logger.debug("Response started")
-
-        # Audio output from TTS
-        if event_type == "response.audio.delta":
-            # Audio arriving means we have a response - stop thinking animation
-            self.deps.movement_manager.set_processing(False)
-
-            # Feed to head wobbler for expressive movement
-            if self.deps.head_wobbler is not None:
-                self.deps.head_wobbler.feed(event.delta)
-
-            self.last_activity_time = asyncio.get_event_loop().time()
-
-            # Queue audio for playback
-            audio_data = np.frombuffer(base64.b64decode(event.delta), dtype=np.int16).reshape(1, -1)
-            await self.output_queue.put((OPENAI_SAMPLE_RATE, audio_data))
-
-        # Response text (for logging and UI)
-        if event_type == "response.audio_transcript.delta":
-            # Streaming transcript of what's being said
-            pass  # Could log incrementally if needed
-
-        if event_type == "response.audio_transcript.done":
-            response_text = event.transcript
-            logger.info("Assistant: %s", response_text[:100] if len(response_text) > 100 else response_text)
-            self._last_assistant_response = response_text  # Track for sync
-            await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": response_text}))
-
-        # Response completed - sync conversation to OpenClaw
-        if event_type == "response.done":
-            self._speaking = False
-            # Grace period: keep mic gated for 1 second after response.done to let
-            # buffered TTS audio finish draining from the output queue.  Without this,
-            # the speaker plays the tail of the audio while the mic is already open,
-            # speaches VAD triggers on that audio, Whisper returns an empty transcript,
-            # and the assertion in speaches' chat_utils.py fires → session crash.
-            self._speaking_until = asyncio.get_event_loop().time() + 1.0
-            self.deps.movement_manager.set_processing(False)
-            if self.deps.head_wobbler is not None:
-                self.deps.head_wobbler.reset()
-            logger.debug("Response completed, mic gated for 1s grace period")
-
-            # Sync conversation to OpenClaw for memory continuity
-            await self._sync_to_openclaw()
-
-        # Tool calls
-        if event_type == "response.function_call_arguments.done":
-            await self._handle_tool_call(event)
+                # Spawn as task so we don't block the event loop
+                asyncio.create_task(self._handle_transcript(transcript))
 
         # Errors
         if event_type == "error":
@@ -427,96 +373,7 @@ OpenClaw has access to many capabilities you don't have directly.""",
             code = getattr(err, "code", "")
             logger.error("OpenAI error [%s]: %s", code, msg)
 
-    async def _handle_tool_call(self, event: Any) -> None:
-        """Handle a tool call from OpenAI."""
-        tool_name = getattr(event, "name", None)
-        args_json = getattr(event, "arguments", None)
-        call_id = getattr(event, "call_id", None)
-
-        if not isinstance(tool_name, str) or not isinstance(args_json, str):
-            return
-
-        logger.info("Tool call: %s(%s)", tool_name, args_json[:50] if len(args_json) > 50 else args_json)
-
-        # Start thinking animation while we process the tool call.
-        # It will stop when the next audio delta arrives or response completes.
-        self.deps.movement_manager.set_processing(True)
-
-        try:
-            if tool_name == "ask_openclaw":
-                result = await self._handle_openclaw_query(args_json)
-            else:
-                # Robot movement tools - dispatch locally
-                result = await dispatch_tool_call(tool_name, args_json, self.deps)
-
-            logger.debug("Tool '%s' result: %s", tool_name, str(result)[:100])
-        except Exception as e:
-            logger.error("Tool '%s' failed: %s", tool_name, e)
-            result = {"error": str(e)}
-
-        # Send result back to continue the conversation
-        if isinstance(call_id, str) and self.connection:
-            await self.connection.conversation.item.create(
-                item={
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": json.dumps(result),
-                }
-            )
-            # Trigger response generation after tool result
-            await self.connection.response.create()
-
-    async def _sync_to_openclaw(self) -> None:
-        """Sync the last conversation turn to OpenClaw for memory continuity."""
-        if not self.openclaw_bridge or not self.openclaw_bridge.is_connected:
-            return
-
-        if self._last_user_message and self._last_assistant_response:
-            try:
-                await self.openclaw_bridge.sync_conversation(self._last_user_message, self._last_assistant_response)
-                # Clear after sync
-                self._last_user_message = None
-                self._last_assistant_response = None
-            except Exception as e:
-                logger.debug("Failed to sync conversation: %s", e)
-
-    async def _handle_openclaw_query(self, args_json: str) -> dict:
-        """Handle a query to OpenClaw."""
-        if self.openclaw_bridge is None or not self.openclaw_bridge.is_connected:
-            return {"error": "OpenClaw not connected"}
-
-        try:
-            args = json.loads(args_json)
-            query = args.get("query", "")
-            include_image = args.get("include_image", False)
-
-            # Capture image if requested
-            image_b64 = None
-            if include_image and self.deps.camera_worker:
-                frame = self.deps.camera_worker.get_latest_frame()
-                if frame is not None:
-                    import cv2
-
-                    _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                    image_b64 = base64.b64encode(buffer).decode("utf-8")
-                    logger.debug("Captured camera image for OpenClaw query")
-
-            # Query OpenClaw
-            response = await self.openclaw_bridge.chat(
-                query,
-                image_b64=image_b64,
-                system_context="User is asking through their Reachy Mini robot. Keep response concise for voice.",
-            )
-
-            if response.error:
-                return {"error": response.error}
-            return {"response": response.content}
-
-        except Exception as e:
-            logger.error("OpenClaw query failed: %s", e)
-            return {"error": str(e)}
-
-    async def receive(self, frame: Tuple[int, NDArray], *, source: str = "robot") -> None:
+    async def receive(self, frame: Tuple[int, NDArray[Any]], *, source: str = "robot") -> None:
         """Receive audio and forward to speaches.
 
         Args:
@@ -561,17 +418,19 @@ OpenClaw has access to many capabilities you don't have directly.""",
 
         # Convert to float for resampling
         if audio.dtype == np.int16:
-            audio = audio.astype(np.float32) / 32768.0
+            audio_float = audio.astype(np.float32) / 32768.0
         elif audio.dtype != np.float32:
-            audio = audio.astype(np.float32)
+            audio_float = audio.astype(np.float32)
+        else:
+            audio_float = audio
 
         # Resample to OpenAI sample rate
         if input_sr != OPENAI_SAMPLE_RATE:
-            num_samples = int(len(audio) * OPENAI_SAMPLE_RATE / input_sr)
-            audio = resample(audio, num_samples).astype(np.float32)
+            num_samples = int(len(audio_float) * OPENAI_SAMPLE_RATE / input_sr)
+            audio_float = resample(audio_float, num_samples).astype(np.float32)  # type: ignore[attr-defined]
 
         # Convert to int16 for OpenAI
-        audio_int16 = (audio * 32767).astype(np.int16)
+        audio_int16 = (audio_float * 32767).astype(np.int16)
 
         # Send to OpenAI
         try:
@@ -584,16 +443,12 @@ OpenClaw has access to many capabilities you don't have directly.""",
         """Get the next output (audio or transcript)."""
         return await wait_for_item(self.output_queue)
 
-    async def shutdown(self) -> None:
+    def shutdown(self) -> None:
         """Shutdown the handler."""
         self._shutdown_requested = True
 
-        if self.connection:
-            try:
-                await self.connection.close()
-            except Exception as e:
-                logger.debug("Connection close: %s", e)
-            self.connection = None
+        # Can't await in sync method, connection will be closed by start_up() loop exit
+        self.connection = None
 
         while not self.output_queue.empty():
             try:

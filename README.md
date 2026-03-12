@@ -296,6 +296,59 @@ When running with the simulator:
 ```bash
 # Start simulator with objects on a table
 reachy-mini-daemon --sim --scene minimal
+
+## Local Models
+- Download the models
+`./init_models.sh`
+- `docker compose up -d`
+
+## Setup OpenClaw with Local LLM
+- Make the following edits with your model choice.
+`.openclaw/openclaw.json`
+
+```
+```
+"models": {
+    "providers": {
+      "llamacpp": {
+        "baseUrl": "http://beskar:8181/v1",
+        "apiKey": "llamacpp-local",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "Qwen3.5-35B-A3B",
+            "name": "Qwen3.5-35B-A3B",
+            "reasoning": false,
+            "input": [
+              "text"
+            ],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 262144,
+            "maxTokens": 8192
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+        "model": {
+          "primary": "llamacpp/Qwen3.5-35B-A3B"
+        },
+        "models": {
+          "llamacpp/Qwen3.5-35B-A3B": {}
+        }
+      }
+  },
+...
+```
+```
+```
 ```
 
 ## 📄 License

@@ -1,10 +1,22 @@
-"""ClawBody - Bridge to OpenClaw Gateway for AI responses.
+"""OpenClaw Bridge - Direct connection to OpenClaw for AI intelligence.
 
-This module provides ClawBody's integration with the OpenClaw gateway
-using the WebSocket protocol (the gateway's native transport).
+This module provides the PRIMARY bridge between ClawBody and OpenClaw.
+OpenClaw is now the main intelligence - this bridge is the direct conduit
+for all user interactions.
 
-ClawBody uses OpenAI Realtime API for voice I/O (speech recognition + TTS)
-but routes all responses through OpenClaw (Clawson) for intelligence.
+ARCHITECTURE CHANGE:
+- OpenClaw is the PRIMARY intelligence (no local LLM anymore)
+- Every user utterance goes directly to OpenClaw
+- No context pre-fetching or stuffing - OpenClaw naturally owns conversation state
+- Proper image attachments (no text hacks)
+- Session management for multi-user scenarios (especially Gradio)
+
+The bridge handles:
+- WebSocket connection to OpenClaw Gateway
+- Authentication and session management
+- Chat operations with proper attachments
+- Event streaming and response collection
+- Session key management for multi-user scenarios
 """
 
 import json
@@ -35,17 +47,25 @@ class OpenClawResponse:
 class OpenClawBridge:
     """Bridge to OpenClaw Gateway using WebSocket protocol.
 
-    The OpenClaw gateway speaks WebSocket with a JSON frame protocol.
-    This class handles the connect handshake, authentication, and
-    chat operations.
+    OpenClaw is the PRIMARY intelligence for this robot. This bridge provides
+    direct access to OpenClaw's conversation capabilities with proper session
+    management and attachment support.
+
+    Session Key Management:
+    - If session_key is provided at init, it's used as-is (full session key)
+    - If None, falls back to: agent:<agent_id>:<config.OPENCLAW_SESSION_KEY>
+    - Can be updated at runtime with set_session_key() for multi-user scenarios
 
     Example:
+        # Default session (uses config)
         bridge = OpenClawBridge()
         await bridge.connect()
-
-        # Simple query
         response = await bridge.chat("Hello!")
-        print(response.content)
+
+        # Gradio session (unique per user)
+        bridge = OpenClawBridge(session_key="reachy-gradio-abc123")
+        await bridge.connect()
+        response = await bridge.chat("Hello!", image_b64="...", deliver=False)
     """
 
     def __init__(
@@ -53,7 +73,9 @@ class OpenClawBridge:
         gateway_url: Optional[str] = None,
         gateway_token: Optional[str] = None,
         agent_id: Optional[str] = None,
+        session_key: Optional[str] = None,
         timeout: float = 120.0,
+        max_turns: Optional[int] = None,
     ):
         """Initialize the OpenClaw bridge.
 
@@ -62,7 +84,13 @@ class OpenClawBridge:
                          Accepts http:// or ws:// schemes; http is converted to ws.
             gateway_token: Authentication token (default: from env/config)
             agent_id: OpenClaw agent ID to use (default: from env/config)
+            session_key: Full session key to use (e.g., "reachy-gradio-abc123").
+                        If None, builds from agent_id and config.OPENCLAW_SESSION_KEY
             timeout: Request timeout in seconds
+            max_turns: Rotate to a fresh session key after this many successful turns.
+                       Prevents context-window overflow on the local LLM.
+                       Only applies to reachy-gradio-* style keys (not custom fixed keys).
+                       Defaults to config.MAX_ROBOT_TURNS_PER_SESSION.
         """
         import os
 
@@ -74,19 +102,23 @@ class OpenClawBridge:
         self.agent_id = agent_id or os.getenv("OPENCLAW_AGENT_ID") or config.OPENCLAW_AGENT_ID
         self.timeout = timeout
 
-        # Session key – "main" shares context with WhatsApp and other channels.
-        # Full key format: agent:<agent_id>:<session_key>
-        self.session_key = os.getenv("OPENCLAW_SESSION_KEY") or config.OPENCLAW_SESSION_KEY or "main"
+        # Session key management - store the provided session key or None for fallback
+        self._session_key = session_key
+
+        # Turn-count rotation: rotate session key after max_turns successful chat() calls
+        # to prevent the local LLM's context window from overflowing.
+        self.max_turns: int = max_turns if max_turns is not None else config.MAX_ROBOT_TURNS_PER_SESSION
+        self._turn_count: int = 0
 
         # Persistent WebSocket state
-        self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._ws: Optional[Any] = None
         self._connected = False
         self._conn_id: Optional[str] = None
 
         # Background listener task & pending request futures
         self._listener_task: Optional[asyncio.Task] = None
         self._pending: dict[str, asyncio.Future] = {}
-        # Events keyed by runId -> list of event payloads
+        # Events keyed by runId -> queue of event payloads
         self._run_events: dict[str, asyncio.Queue] = {}
 
     # ------------------------------------------------------------------
@@ -105,6 +137,60 @@ class OpenClawBridge:
         return url
 
     # ------------------------------------------------------------------
+    # Session key management
+    # ------------------------------------------------------------------
+
+    def _full_session_key(self) -> str:
+        """Build the full session key.
+
+        If a session key was provided at init, use it as-is.
+        Otherwise build: agent:<agentId>:<config.OPENCLAW_SESSION_KEY>
+        """
+        if self._session_key:
+            return self._session_key
+        return f"agent:{self.agent_id}:{config.OPENCLAW_SESSION_KEY}"
+
+    def set_session_key(self, session_key: str) -> None:
+        """Update the session key at runtime.
+
+        This is useful for multi-user scenarios (e.g., Gradio) where each
+        user needs their own session.
+
+        Args:
+            session_key: The full session key to use (e.g., "reachy-gradio-abc123")
+        """
+        self._session_key = session_key
+        self._turn_count = 0
+        logger.debug("Updated session key to: %s (turn count reset)", session_key)
+
+    def _rotate_session_if_needed(self) -> None:
+        """Rotate to a fresh session key if the turn limit has been reached.
+
+        Only rotates keys that follow the reachy-gradio-* prefix pattern.
+        Custom fixed session keys (e.g., "agent:main:main") are never rotated.
+        The turn counter is checked BEFORE the call so the new session is used
+        for the next request.
+        """
+        if self._turn_count < self.max_turns:
+            return
+
+        # Only rotate auto-generated prefix-style keys, not custom fixed ones.
+        prefix = config.OPENCLAW_SESSION_KEY_PREFIX
+        if self._session_key and not self._session_key.startswith(prefix):
+            return
+
+        old_key = self._session_key or self._full_session_key()
+        new_key = f"{prefix}-{uuid.uuid4().hex[:8]}"
+        self._session_key = new_key
+        self._turn_count = 0
+        logger.info(
+            "Session rotated after %d turns: %s → %s",
+            self.max_turns,
+            old_key,
+            new_key,
+        )
+
+    # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
 
@@ -115,9 +201,10 @@ class OpenClawBridge:
             True if connection successful, False otherwise
         """
         logger.info(
-            "Connecting to OpenClaw at %s (token: %s)",
+            "Connecting to OpenClaw at %s (token: %s, session: %s)",
             self.gateway_url,
             "set" if self.gateway_token else "not set",
+            self._full_session_key(),
         )
         try:
             # The gateway checks the HTTP Origin header. The Python websockets
@@ -133,7 +220,9 @@ class OpenClawBridge:
             )
 
             # 1. Receive challenge
-            raw = await asyncio.wait_for(self._ws.recv(), timeout=10)
+            if self._ws is None:
+                raise Exception("WebSocket connection failed")
+            raw = await asyncio.wait_for(self._ws.recv(), timeout=10)  # type: ignore
             challenge = json.loads(raw)
             if challenge.get("event") != "connect.challenge":
                 logger.warning("Unexpected first frame: %s", challenge.get("event"))
@@ -149,19 +238,19 @@ class OpenClawBridge:
                     "maxProtocol": PROTOCOL_VERSION,
                     "auth": {"token": self.gateway_token} if self.gateway_token else {},
                     "client": {
-                        "id": "webchat",
+                        "id": "cli",
                         "version": "1.0.0",
                         "platform": "linux",
-                        "mode": "webchat",
+                        "mode": "backend",
                     },
                     "role": "operator",
                     "scopes": ["chat", "operator.write", "operator.read"],
                 },
             }
-            await self._ws.send(json.dumps(connect_req))
+            await self._ws.send(json.dumps(connect_req))  # type: ignore
 
             # 3. Read hello response
-            raw = await asyncio.wait_for(self._ws.recv(), timeout=10)
+            raw = await asyncio.wait_for(self._ws.recv(), timeout=10)  # type: ignore
             hello = json.loads(raw)
 
             if hello.get("ok"):
@@ -223,7 +312,9 @@ class OpenClawBridge:
     async def _listen_loop(self) -> None:
         """Background task that reads all frames from the WebSocket."""
         try:
-            async for raw in self._ws:
+            if self._ws is None:
+                return
+            async for raw in self._ws:  # type: ignore
                 try:
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
@@ -245,9 +336,10 @@ class OpenClawBridge:
         if msg_type == "res":
             # Response to a request we sent
             req_id = msg.get("id")
-            fut = self._pending.pop(req_id, None)
-            if fut and not fut.done():
-                fut.set_result(msg)
+            if req_id is not None:
+                fut = self._pending.pop(req_id, None)
+                if fut and not fut.done():
+                    fut.set_result(msg)
 
         elif msg_type == "event":
             event_name = msg.get("event", "")
@@ -289,7 +381,7 @@ class OpenClawBridge:
         self._pending[req_id] = fut
 
         try:
-            await self._ws.send(json.dumps(req))
+            await self._ws.send(json.dumps(req))  # type: ignore
             result = await asyncio.wait_for(fut, timeout=timeout or self.timeout)
             return result
         except asyncio.TimeoutError:
@@ -299,10 +391,6 @@ class OpenClawBridge:
             self._pending.pop(req_id, None)
             return {"ok": False, "error": {"code": "ERROR", "message": str(e)}}
 
-    def _full_session_key(self) -> str:
-        """Build the full session key: agent:<agentId>:<sessionKey>."""
-        return f"agent:{self.agent_id}:{self.session_key}"
-
     # ------------------------------------------------------------------
     # Chat API
     # ------------------------------------------------------------------
@@ -311,19 +399,17 @@ class OpenClawBridge:
         self,
         message: str,
         image_b64: Optional[str] = None,
-        system_context: Optional[str] = None,
+        deliver: bool = False,
     ) -> OpenClawResponse:
         """Send a message to OpenClaw and get a response.
 
-        OpenClaw maintains conversation memory on its end, so it will be aware
-        of conversations from other channels (WhatsApp, web, etc.). We only send
-        the current message and let OpenClaw handle the context.
+        OpenClaw is the PRIMARY intelligence - this sends the message directly
+        to OpenClaw which maintains all conversation state and context.
 
         Args:
             message: The user's message (transcribed speech)
-            image_b64: Optional base64-encoded image from robot camera (not yet
-                       supported over WebSocket chat.send – reserved for future)
-            system_context: Optional additional system context (prepended to message)
+            image_b64: Optional base64-encoded JPEG image (pure base64, no data URL prefix)
+            deliver: Whether to deliver to external channels (WhatsApp etc) - almost always False
 
         Returns:
             OpenClawResponse with the AI's response
@@ -331,26 +417,34 @@ class OpenClawBridge:
         if not self._connected:
             return OpenClawResponse(content="", error="Not connected to OpenClaw")
 
-        # Prefix system context if provided
-        final_message = message
-        if system_context:
-            final_message = f"[System: {system_context}]\n\n{message}"
+        # Rotate session key if the turn limit has been reached.
+        self._rotate_session_if_needed()
 
-        # If image provided, mention it (WebSocket protocol uses string messages;
-        # image passing would require a separate mechanism)
-        if image_b64:
-            final_message = f"[Image attached]\n{final_message}"
-
+        # Generate idempotency key and pre-register event queue to avoid race conditions
+        # (events can arrive before we register the queue if we wait for the response)
         idempotency_key = str(uuid.uuid4())
+        event_queue: asyncio.Queue = asyncio.Queue()
+        self._run_events[idempotency_key] = event_queue  # register BEFORE sending
+
         session_key = self._full_session_key()
 
-        # Create a queue to collect events for this run
-        # We'll get the runId from the response
+        # Build request parameters
         params = {
             "idempotencyKey": idempotency_key,
             "sessionKey": session_key,
-            "message": final_message,
+            "message": message,
+            "deliver": deliver,
         }
+
+        # Add proper image attachment if provided
+        if image_b64:
+            params["attachments"] = [
+                {
+                    "type": "image",
+                    "mimeType": "image/jpeg",
+                    "content": image_b64,  # pure base64, no data URL prefix
+                }
+            ]
 
         try:
             # Send the request
@@ -362,13 +456,11 @@ class OpenClawBridge:
                 logger.error("chat.send failed: %s", error_msg)
                 return OpenClawResponse(content="", error=error_msg)
 
-            run_id = resp.get("payload", {}).get("runId")
-            if not run_id:
-                return OpenClawResponse(content="", error="No runId in response")
+            run_id = resp.get("payload", {}).get("runId") or idempotency_key
 
-            # Register a queue to receive events for this run
-            event_queue: asyncio.Queue = asyncio.Queue()
-            self._run_events[run_id] = event_queue
+            # If run_id differs from idempotency_key, move the event queue
+            if run_id != idempotency_key:
+                self._run_events[run_id] = self._run_events.pop(idempotency_key)
 
             try:
                 # Collect the streamed response
@@ -411,6 +503,7 @@ class OpenClawBridge:
                             break
                         return OpenClawResponse(content="", error="Response timeout")
 
+                self._turn_count += 1
                 return OpenClawResponse(content=full_text)
 
             finally:
@@ -424,12 +517,14 @@ class OpenClawBridge:
         self,
         message: str,
         image_b64: Optional[str] = None,
+        deliver: bool = False,
     ) -> AsyncIterator[str]:
         """Stream a response from OpenClaw.
 
         Args:
             message: The user's message
-            image_b64: Optional base64-encoded image
+            image_b64: Optional base64-encoded JPEG image (pure base64, no data URL prefix)
+            deliver: Whether to deliver to external channels (WhatsApp etc) - almost always False
 
         Yields:
             String chunks of the response as they arrive
@@ -438,15 +533,30 @@ class OpenClawBridge:
             yield "[Error: Not connected to OpenClaw]"
             return
 
-        final_message = message
-        if image_b64:
-            final_message = f"[Image attached]\n{message}"
+        # Rotate session key if the turn limit has been reached.
+        self._rotate_session_if_needed()
+
+        # Generate idempotency key and pre-register event queue
+        idempotency_key = str(uuid.uuid4())
+        event_queue: asyncio.Queue = asyncio.Queue()
+        self._run_events[idempotency_key] = event_queue  # register BEFORE sending
 
         params = {
-            "idempotencyKey": str(uuid.uuid4()),
+            "idempotencyKey": idempotency_key,
             "sessionKey": self._full_session_key(),
-            "message": final_message,
+            "message": message,
+            "deliver": deliver,
         }
+
+        # Add proper image attachment if provided
+        if image_b64:
+            params["attachments"] = [
+                {
+                    "type": "image",
+                    "mimeType": "image/jpeg",
+                    "content": image_b64,  # pure base64, no data URL prefix
+                }
+            ]
 
         try:
             resp = await self._send_request("chat.send", params, timeout=30)
@@ -456,16 +566,13 @@ class OpenClawBridge:
                 yield f"[Error: {err.get('message', 'Unknown error')}]"
                 return
 
-            run_id = resp.get("payload", {}).get("runId")
-            if not run_id:
-                yield "[Error: No runId]"
-                return
+            run_id = resp.get("payload", {}).get("runId") or idempotency_key
 
-            event_queue: asyncio.Queue = asyncio.Queue()
-            self._run_events[run_id] = event_queue
+            # If run_id differs from idempotency_key, move the event queue
+            if run_id != idempotency_key:
+                self._run_events[run_id] = self._run_events.pop(idempotency_key)
 
             try:
-                prev_text = ""
                 while True:
                     try:
                         event = await asyncio.wait_for(event_queue.get(), timeout=self.timeout)
@@ -482,9 +589,11 @@ class OpenClawBridge:
                                     yield delta
 
                             elif stream == "lifecycle" and data.get("phase") == "end":
+                                self._turn_count += 1
                                 break
 
                         elif event_name == "chat" and payload.get("state") == "final":
+                            self._turn_count += 1
                             break
 
                     except asyncio.TimeoutError:
@@ -502,84 +611,17 @@ class OpenClawBridge:
         """Check if bridge is connected to gateway."""
         return self._connected
 
-    async def get_agent_context(self) -> Optional[str]:
-        """Fetch the agent's current context, personality, and memory summary.
-
-        This asks OpenClaw to provide a summary of:
-        - The agent's personality and identity
-        - Recent conversation context
-        - Important memories about the user
-        - Current state
-
-        Returns:
-            A context string to use as system instructions, or None if failed
-        """
-        try:
-            response = await self.chat(
-                message="Provide your current context summary for the robot body.",
-                system_context=(
-                    "You are being asked to provide your current context for your robot body. "
-                    "Output a comprehensive context summary that another AI can use to embody you. Include: "
-                    "1. YOUR IDENTITY: Who you are, your name, your personality traits, how you speak. "
-                    "2. USER CONTEXT: What you know about the user (name, preferences, relationship). "
-                    "3. RECENT CONTEXT: Summary of recent conversations or important ongoing topics. "
-                    "4. MEMORIES: Key things you remember that are relevant to interactions. "
-                    "5. CURRENT STATE: Any relevant time/date awareness, ongoing tasks. "
-                    "Be specific and personal. This context will be used by your robot body to speak and act AS YOU. "
-                    "Output ONLY the context summary, no preamble."
-                ),
-            )
-
-            if response.error:
-                logger.warning("Failed to get agent context: %s", response.error)
-                return None
-
-            if response.content:
-                logger.info(
-                    "Retrieved agent context from OpenClaw (%d chars)",
-                    len(response.content),
-                )
-                return response.content
-
-            logger.warning("No context returned from OpenClaw")
-            return None
-
-        except Exception as e:
-            logger.error("Failed to get agent context: %s", e)
-            return None
-
-    async def sync_conversation(self, user_message: str, assistant_response: str) -> None:
-        """Sync a conversation turn back to OpenClaw for memory continuity.
-
-        Args:
-            user_message: What the user said
-            assistant_response: What the robot/AI responded
-        """
-        try:
-            await self.chat(
-                message=(
-                    f"[ROBOT BODY SYNC] The following happened through the Reachy Mini robot:\n"
-                    f"User said: {user_message}\n"
-                    f"You responded: {assistant_response}\n"
-                    f"Remember this as part of your ongoing conversation."
-                ),
-                system_context=(
-                    "[ROBOT BODY SYNC] The following conversation happened through your "
-                    "Reachy Mini robot body. Remember it as part of your ongoing conversation "
-                    "with the user."
-                ),
-            )
-            logger.debug("Synced conversation to OpenClaw")
-        except Exception as e:
-            logger.debug("Failed to sync conversation: %s", e)
-
 
 # Global bridge instance (lazy initialization)
 _bridge: Optional[OpenClawBridge] = None
 
 
 def get_bridge() -> OpenClawBridge:
-    """Get the global OpenClaw bridge instance."""
+    """Get the global OpenClaw bridge instance.
+
+    Returns a bridge using default configuration. For custom session keys
+    (e.g., Gradio), create a dedicated instance or call set_session_key().
+    """
     global _bridge
     if _bridge is None:
         _bridge = OpenClawBridge()

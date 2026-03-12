@@ -69,7 +69,20 @@ services:
   # service to kyber's docker-compose.yml.
   # ============================================================================
   speaches:
-    image: ghcr.io/speaches-ai/speaches:latest-cuda
+    # Local build — ctranslate2 compiled from source with CUDA on aarch64.
+    # The official ghcr.io image ships a CPU-only ctranslate2 PyPI wheel for
+    # aarch64 (~16 MB, no cuBLAS/cuDNN), making GPU inference impossible.
+    # This Dockerfile rebuilds ctranslate2 with -DWITH_CUDA=ON -DWITH_CUDNN=ON
+    # (sm_121, CUDA 13.0) and also replaces onnxruntime → onnxruntime-gpu.
+    # Build:  docker compose build speaches   (~20-30 min first time, cached after)
+    image: ${SPEACHES_IMAGE:-clawbody-speaches:cuda13-sm121}
+    build:
+      context: .
+      dockerfile: Dockerfile.speaches
+      args:
+        CUDA_VERSION: ${CUDA_VERSION:-13.0.0}
+        CUDA_ARCHITECTURES: ${CUDA_ARCHITECTURES:-121}
+        SPEACHES_VERSION: ${SPEACHES_VERSION:-v0.9.0-rc.3}
     container_name: speaches
     runtime: nvidia
     network_mode: host
@@ -82,16 +95,16 @@ services:
       CHAT_COMPLETION_BASE_URL: ${CHAT_COMPLETION_BASE_URL:-http://localhost:${HOST_PORT:-8181}/v1}
       CHAT_COMPLETION_API_KEY: ${CHAT_COMPLETION_API_KEY:-dummy}
 
-      # Whisper STT — use CPU with int8 quantization.
-      # The latest-cuda image on aarch64 ships a CTranslate2 wheel that was
-      # NOT compiled with CUDA support, causing a ValueError at runtime when
-      # device=cuda is requested.  CPU + int8 is fast enough for real-time
-      # transcription and works on all platforms.
-      WHISPER__INFERENCE_DEVICE: cpu
-      WHISPER__COMPUTE_TYPE: int8
+      # Whisper STT — GPU inference via ctranslate2 built with CUDA support.
+      # float16 gives full Tensor Core utilisation on the GB10 Blackwell GPU.
+      # (Previously forced to cpu/int8 because the upstream aarch64 wheel had
+      # no CUDA support — no longer needed with this custom build.)
+      WHISPER__INFERENCE_DEVICE: cuda
+      WHISPER__COMPUTE_TYPE: float16
 
-      # Pre-load models at startup to avoid cold-start on first request
-      PRELOAD_MODELS: "${SPEACHES_STT_MODEL:-Systran/faster-distil-whisper-small.en},${SPEACHES_TTS_MODEL:-speaches-ai/Kokoro-82M-v1.0-ONNX}"
+      # Pre-load models at startup to avoid cold-start on first request.
+      # pydantic-settings v2 requires JSON array format for list[str] fields.
+      PRELOAD_MODELS: '["${SPEACHES_STT_MODEL:-Systran/faster-distil-whisper-small.en}","${SPEACHES_TTS_MODEL:-speaches-ai/Kokoro-82M-v1.0-ONNX}"]'
 
       # Host speaches binds to and also uses for its own internal loopback calls.
       # MUST match SPEACHES_HOST in your .envrc.
@@ -122,7 +135,9 @@ services:
     volumes:
       - hf-hub-cache:/home/ubuntu/.cache/huggingface/hub
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:${SPEACHES_PORT:-8233}/health"]
+      # Must use SPEACHES_HOST, not localhost — speaches binds to the real hostname
+      # (not 0.0.0.0) on aarch64 Linux where 0.0.0.0→127.0.0.1 routing doesn't hold.
+      test: ["CMD-SHELL", "curl --fail http://${SPEACHES_HOST:-localhost}:${SPEACHES_PORT:-8233}/health"]
       interval: 30s
       timeout: 10s
       retries: 3

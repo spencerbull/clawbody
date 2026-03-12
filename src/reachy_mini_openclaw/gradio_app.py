@@ -63,6 +63,8 @@ def launch_gradio(
         nonlocal app_instance
 
         from reachy_mini_openclaw.main import ClawBodyCore
+        import uuid
+        from reachy_mini_openclaw.config import config as app_config
 
         if app_instance is not None:
             return "Already running"
@@ -75,12 +77,16 @@ def launch_gradio(
             if head_tracker_type is not None:
                 set_head_tracker_type(head_tracker_type)
 
+            session_key = f"{app_config.OPENCLAW_SESSION_KEY_PREFIX}-{str(uuid.uuid4())[:8]}"
+            logger.info("Starting new OpenClaw session: %s", session_key)
+
             app_instance = ClawBodyCore(
                 gateway_url=gateway_url,
                 robot_name=robot_name,
                 enable_camera=enable_camera,
                 enable_openclaw=enable_openclaw,
                 browser_bridge=bridge,
+                session_key=session_key,
             )
 
             # Run in background thread
@@ -240,7 +246,7 @@ def launch_gradio(
             ### Current Configuration
 
             - **OpenClaw Gateway**: {gateway_url}
-            - **Speaches Model**: {config.SPEACHES_REALTIME_MODEL}
+            - **Session Key Prefix**: {config.OPENCLAW_SESSION_KEY_PREFIX}
             - **Voice**: {config.SPEACHES_VOICE}
             - **STT Model**: {config.SPEACHES_STT_MODEL}
             - **TTS Model**: {config.SPEACHES_TTS_MODEL}
@@ -258,8 +264,8 @@ def launch_gradio(
 
             This application combines:
 
-            - **OpenAI Realtime API** for ultra-low-latency voice conversation
-            - **OpenClaw Gateway** for extended AI capabilities (web, calendar, smart home, etc.)
+            - **speaches** for local STT (Whisper) and TTS (Kokoro)
+            - **OpenClaw Gateway** as primary AI intelligence (web, calendar, smart home, etc.)
             - **Reachy Mini Robot** for physical embodiment with expressive movements
 
             ### Browser Audio
