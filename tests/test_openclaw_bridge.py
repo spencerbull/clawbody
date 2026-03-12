@@ -215,3 +215,91 @@ class TestStreamChat:
         async for chunk in bridge.stream_chat("hello"):
             chunks.append(chunk)
         assert any("Error" in c for c in chunks)
+
+
+class TestSessionRotation:
+    """Session key rotates after max_turns to prevent context-window overflow."""
+
+    async def test_session_rotates_after_max_turns(self, fake_gateway):
+        """After max_turns successful chat() calls the session key changes."""
+        bridge = OpenClawBridge(
+            gateway_url=fake_gateway.url,
+            session_key="reachy-gradio-aabbccdd",
+            max_turns=3,
+        )
+        await bridge.connect()
+
+        initial_key = bridge._full_session_key()
+        assert initial_key == "reachy-gradio-aabbccdd"
+
+        # Three successful turns — should NOT rotate yet (check at START of call)
+        for _ in range(3):
+            await bridge.chat("hello")
+
+        assert bridge._turn_count == 3
+
+        # Next call triggers rotation before sending
+        await bridge.chat("hello")
+
+        rotated_key = bridge._full_session_key()
+        assert rotated_key != initial_key
+        assert rotated_key.startswith("reachy-gradio-")
+        # Turn count resets after rotation; the 4th call completes so count == 1
+        assert bridge._turn_count == 1
+
+        await bridge.disconnect()
+
+    async def test_turn_count_resets_after_rotation(self, fake_gateway):
+        """Turn counter is 0 immediately after rotation fires."""
+        bridge = OpenClawBridge(
+            gateway_url=fake_gateway.url,
+            session_key="reachy-gradio-11223344",
+            max_turns=2,
+        )
+        await bridge.connect()
+
+        # Fill to limit
+        await bridge.chat("one")
+        await bridge.chat("two")
+        assert bridge._turn_count == 2
+
+        # This call rotates first, then succeeds → count becomes 1
+        await bridge.chat("three")
+        assert bridge._turn_count == 1
+
+        await bridge.disconnect()
+
+    async def test_no_rotation_on_error(self, fake_gateway):
+        """Failed chat() calls do not increment the turn counter."""
+        bridge = OpenClawBridge(
+            gateway_url=fake_gateway.url,
+            session_key="reachy-gradio-deadbeef",
+            max_turns=3,
+        )
+        # Don't connect — every call will return an error immediately
+        assert not bridge.is_connected
+
+        for _ in range(10):
+            response = await bridge.chat("hello")
+            assert response.error is not None
+
+        assert bridge._turn_count == 0
+
+    def test_custom_fixed_key_not_rotated(self):
+        """Keys that don't start with the prefix are never rotated."""
+        bridge = OpenClawBridge(
+            session_key="agent:main:main",
+            max_turns=1,
+        )
+        bridge._turn_count = 999  # way past limit
+        bridge._rotate_session_if_needed()
+        # Key unchanged — it's not a reachy-gradio-* key
+        assert bridge._full_session_key() == "agent:main:main"
+
+    def test_set_session_key_resets_turn_count(self):
+        """set_session_key() resets the turn counter."""
+        bridge = OpenClawBridge(session_key="reachy-gradio-aaaabbbb", max_turns=10)
+        bridge._turn_count = 7
+        bridge.set_session_key("reachy-gradio-new00001")
+        assert bridge._turn_count == 0
+        assert bridge._full_session_key() == "reachy-gradio-new00001"

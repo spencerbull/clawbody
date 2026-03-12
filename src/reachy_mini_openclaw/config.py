@@ -71,6 +71,13 @@ class Config:
     OPENCLAW_SESSION_KEY_PREFIX: str = field(
         default_factory=lambda: os.getenv("OPENCLAW_SESSION_KEY_PREFIX", "reachy-gradio")
     )
+    # Maximum voice turns before rotating to a fresh session key.
+    # Prevents context-window overflow on the local LLM (Qwen 32K limit).
+    # Each turn = one user utterance + one assistant reply = ~2 messages in the session.
+    # At 30 turns (~60 messages) we stay well inside the 32K token limit.
+    MAX_ROBOT_TURNS_PER_SESSION: int = field(
+        default_factory=lambda: int(os.getenv("MAX_ROBOT_TURNS_PER_SESSION", "30"))
+    )
 
     # ---------------------------------------------------------------------------
     # Robot

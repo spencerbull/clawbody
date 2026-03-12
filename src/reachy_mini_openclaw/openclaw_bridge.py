@@ -75,6 +75,7 @@ class OpenClawBridge:
         agent_id: Optional[str] = None,
         session_key: Optional[str] = None,
         timeout: float = 120.0,
+        max_turns: Optional[int] = None,
     ):
         """Initialize the OpenClaw bridge.
 
@@ -86,6 +87,10 @@ class OpenClawBridge:
             session_key: Full session key to use (e.g., "reachy-gradio-abc123").
                         If None, builds from agent_id and config.OPENCLAW_SESSION_KEY
             timeout: Request timeout in seconds
+            max_turns: Rotate to a fresh session key after this many successful turns.
+                       Prevents context-window overflow on the local LLM.
+                       Only applies to reachy-gradio-* style keys (not custom fixed keys).
+                       Defaults to config.MAX_ROBOT_TURNS_PER_SESSION.
         """
         import os
 
@@ -99,6 +104,11 @@ class OpenClawBridge:
 
         # Session key management - store the provided session key or None for fallback
         self._session_key = session_key
+
+        # Turn-count rotation: rotate session key after max_turns successful chat() calls
+        # to prevent the local LLM's context window from overflowing.
+        self.max_turns: int = max_turns if max_turns is not None else config.MAX_ROBOT_TURNS_PER_SESSION
+        self._turn_count: int = 0
 
         # Persistent WebSocket state
         self._ws: Optional[Any] = None
@@ -150,7 +160,35 @@ class OpenClawBridge:
             session_key: The full session key to use (e.g., "reachy-gradio-abc123")
         """
         self._session_key = session_key
-        logger.debug("Updated session key to: %s", session_key)
+        self._turn_count = 0
+        logger.debug("Updated session key to: %s (turn count reset)", session_key)
+
+    def _rotate_session_if_needed(self) -> None:
+        """Rotate to a fresh session key if the turn limit has been reached.
+
+        Only rotates keys that follow the reachy-gradio-* prefix pattern.
+        Custom fixed session keys (e.g., "agent:main:main") are never rotated.
+        The turn counter is checked BEFORE the call so the new session is used
+        for the next request.
+        """
+        if self._turn_count < self.max_turns:
+            return
+
+        # Only rotate auto-generated prefix-style keys, not custom fixed ones.
+        prefix = config.OPENCLAW_SESSION_KEY_PREFIX
+        if self._session_key and not self._session_key.startswith(prefix):
+            return
+
+        old_key = self._session_key or self._full_session_key()
+        new_key = f"{prefix}-{uuid.uuid4().hex[:8]}"
+        self._session_key = new_key
+        self._turn_count = 0
+        logger.info(
+            "Session rotated after %d turns: %s → %s",
+            self.max_turns,
+            old_key,
+            new_key,
+        )
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -379,6 +417,9 @@ class OpenClawBridge:
         if not self._connected:
             return OpenClawResponse(content="", error="Not connected to OpenClaw")
 
+        # Rotate session key if the turn limit has been reached.
+        self._rotate_session_if_needed()
+
         # Generate idempotency key and pre-register event queue to avoid race conditions
         # (events can arrive before we register the queue if we wait for the response)
         idempotency_key = str(uuid.uuid4())
@@ -462,6 +503,7 @@ class OpenClawBridge:
                             break
                         return OpenClawResponse(content="", error="Response timeout")
 
+                self._turn_count += 1
                 return OpenClawResponse(content=full_text)
 
             finally:
@@ -490,6 +532,9 @@ class OpenClawBridge:
         if not self._connected:
             yield "[Error: Not connected to OpenClaw]"
             return
+
+        # Rotate session key if the turn limit has been reached.
+        self._rotate_session_if_needed()
 
         # Generate idempotency key and pre-register event queue
         idempotency_key = str(uuid.uuid4())
@@ -544,9 +589,11 @@ class OpenClawBridge:
                                     yield delta
 
                             elif stream == "lifecycle" and data.get("phase") == "end":
+                                self._turn_count += 1
                                 break
 
                         elif event_name == "chat" and payload.get("state") == "final":
+                            self._turn_count += 1
                             break
 
                     except asyncio.TimeoutError:
