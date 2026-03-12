@@ -135,7 +135,9 @@ services:
     volumes:
       - hf-hub-cache:/home/ubuntu/.cache/huggingface/hub
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:${SPEACHES_PORT:-8233}/health"]
+      # Must use SPEACHES_HOST, not localhost — speaches binds to the real hostname
+      # (not 0.0.0.0) on aarch64 Linux where 0.0.0.0→127.0.0.1 routing doesn't hold.
+      test: ["CMD-SHELL", "curl --fail http://${SPEACHES_HOST:-localhost}:${SPEACHES_PORT:-8233}/health"]
       interval: 30s
       timeout: 10s
       retries: 3
